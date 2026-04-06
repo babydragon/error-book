@@ -1,0 +1,33 @@
+[llm]
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+api_key = "your-api-key"
+chat_model = "gemini-3.1-pro-preview"
+embedding_model = "gemini-embedding-2-preview"
+embedding_dimensions = 1536
+# Google AI Studio API base URL（用于 embedding 等需要原生 Google 格式的接口）
+# 默认从 base_url 自动推导（去掉 /openai/ 后缀），也可显式指定
+# google_base_url = "https://generativelanguage.googleapis.com"
+
+[llm.retry]
+max_attempts = 5
+base_delay_ms = 500
+max_delay_ms = 30000
+retryable_status_codes = [429, 500, 502, 503, 504]
+
+[database]
+url = "file://./data/error_book.db"
+# auth_token = "your-token"
+
+[storage]
+image_dir = "./data/images"
+pdf_dir = "./data/pdfs"
+
+[defaults]
+grade_level = "二年级"
+
+[pdf]
+font_path = "./fonts/NotoSansSC-Regular.ttf"
+
+[search]
+# 混合搜索时图片 embedding 的权重 (0.0~1.0)，文本权重 = 1.0 - image_weight
+image_weight = 0.3

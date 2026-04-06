@@ -1,0 +1,25 @@
+# 构建产物
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 运行时数据（数据库、图片、PDF）
+/data/
+
+# 字体文件（体积大，需单独下载）
+/fonts/
+
+# 配置（含 API key，不入库）
+config.toml
+config.toml.bak
+
+# 开发计划文档
+/plan/
+
+# OS
+.DS_Store
+Thumbs.db
