@@ -109,7 +109,6 @@ impl Repository {
         if let Some(t) = to {
             conditions.push(format!("created_at <= ?{}", param_idx));
             param_values.push(libsql::Value::from(t.and_utc().timestamp()));
-            param_idx += 1;
         }
 
         let where_clause = if conditions.is_empty() {

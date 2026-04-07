@@ -348,6 +348,8 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 |------|------|
 | `analyze_error` | 分析错题图片 |
 | `show_error` | 查看错题详情 |
+| `show_summary` | 查看总结详情 |
+| `show_practice` | 查看练习详情 |
 | `list_errors` | 列出错题记录 |
 | `list_summaries` | 列出已生成的总结记录 |
 | `list_practices` | 列出已生成的练习题记录 |
@@ -355,6 +357,42 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 | `generate_summary` | 生成阶段性总结 |
 | `generate_practice` | 生成巩固练习题（支持额外要求） |
 | `generate_practice_pdf` | 按已有练习集 ID 导出 PDF |
+
+说明：以上 MCP 工具现在统一返回 **JSON 字符串**，顶层结构为：
+
+```json
+{
+  "ok": true,
+  "data": { ... }
+}
+```
+
+失败时返回：
+
+```json
+{
+  "ok": false,
+  "error": "..."
+}
+```
+
+项目内还提供了两个最小工作流 skill：
+
+- `skills/error-intake/SKILL.md`
+- `skills/summary-practice-coach/SKILL.md`
+
+适合 OpenClaw 一类需要工作流提示的客户端，分工如下：
+
+1. **错题录入 / 单题分析**
+   - `analyze_error`
+   - `show_error`
+
+2. **阶段性总结 / 生成练习 / 导出 PDF**
+   - `generate_summary` -> `show_summary`
+   - `generate_practice` -> `show_practice`
+   - `generate_practice_pdf`
+
+这样可以避免在刚录入少量错题、样本不足时，客户端过早进入“总结并生成练习”的流程。
 
 ### 在客户端中配置
 
