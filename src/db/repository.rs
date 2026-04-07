@@ -317,16 +317,27 @@ impl Repository {
     }
 
     /// 按科目查询总结列表
-    pub async fn list_summaries(&self, subject: Option<&str>) -> Result<Vec<Summary>> {
+    pub async fn list_summaries(&self, subject: Option<&str>, limit: Option<u32>) -> Result<Vec<Summary>> {
         let conn = self.conn()?;
+
+        let limit_clause = match limit {
+            Some(l) => format!(" LIMIT {}", l),
+            None => String::new(),
+        };
 
         let (sql, param_values): (String, Vec<libsql::Value>) = match subject {
             Some(s) => (
-                "SELECT id, subject, period_type, period_start, period_end, common_reasons, common_suggestions, weak_points, detail, related_error_ids, created_at FROM summaries WHERE subject = ?1 ORDER BY created_at DESC".to_string(),
+                format!(
+                    "SELECT id, subject, period_type, period_start, period_end, common_reasons, common_suggestions, weak_points, detail, related_error_ids, created_at FROM summaries WHERE subject = ?1 ORDER BY created_at DESC{}",
+                    limit_clause
+                ),
                 vec![libsql::Value::from(s.to_string())],
             ),
             None => (
-                "SELECT id, subject, period_type, period_start, period_end, common_reasons, common_suggestions, weak_points, detail, related_error_ids, created_at FROM summaries ORDER BY created_at DESC".to_string(),
+                format!(
+                    "SELECT id, subject, period_type, period_start, period_end, common_reasons, common_suggestions, weak_points, detail, related_error_ids, created_at FROM summaries ORDER BY created_at DESC{}",
+                    limit_clause
+                ),
                 Vec::new(),
             ),
         };
@@ -360,6 +371,86 @@ impl Repository {
 
     // ===== 巩固练习 =====
 
+    /// 按 ID 查询练习集
+    pub async fn get_practice_set(&self, id: &str) -> Result<Option<PracticeSet>> {
+        let conn = self.conn()?;
+        let mut rows = conn
+            .query(
+                "SELECT id, summary_id, subject, requirements, questions, pdf_path, created_at FROM practice_sets WHERE id = ?1",
+                [id],
+            )
+            .await?;
+
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_practice_set(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// 查询练习集列表
+    pub async fn list_practice_sets(
+        &self,
+        subject: Option<&str>,
+        summary_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<PracticeSet>> {
+        let conn = self.conn()?;
+
+        let mut conditions = Vec::new();
+        let mut param_values: Vec<libsql::Value> = Vec::new();
+        let mut param_idx = 1;
+
+        if let Some(s) = subject {
+            conditions.push(format!("subject = ?{}", param_idx));
+            param_values.push(libsql::Value::from(s.to_string()));
+            param_idx += 1;
+        }
+        if let Some(id) = summary_id {
+            conditions.push(format!("summary_id = ?{}", param_idx));
+            param_values.push(libsql::Value::from(id.to_string()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let limit_clause = match limit {
+            Some(l) => format!("LIMIT {}", l),
+            None => String::new(),
+        };
+
+        let sql = format!(
+            "SELECT id, summary_id, subject, requirements, questions, pdf_path, created_at FROM practice_sets {} ORDER BY created_at DESC {}",
+            where_clause, limit_clause
+        );
+
+        let mut rows = conn
+            .query(&sql, libsql::params_from_iter(param_values))
+            .await?;
+
+        let mut practices = Vec::new();
+        while let Some(row) = rows.next().await? {
+            practices.push(row_to_practice_set(&row)?);
+        }
+        Ok(practices)
+    }
+
+    /// 更新练习集的 pdf_path
+    pub async fn update_practice_set_pdf_path(&self, id: &str, pdf_path: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE practice_sets SET pdf_path = ?1 WHERE id = ?2",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(pdf_path.to_string()),
+                libsql::Value::from(id.to_string()),
+            ]),
+        ).await?;
+        tracing::info!(id = %id, path = %pdf_path, "练习集 pdf_path 已更新");
+        Ok(())
+    }
+
     /// 插入练习集
     pub async fn insert_practice_set(&self, practice: &PracticeSet) -> Result<()> {
         let conn = self.conn()?;
@@ -367,12 +458,13 @@ impl Repository {
             practice.id.clone().into(),
             practice.summary_id.clone().into(),
             practice.subject.clone().into(),
+            practice.requirements.clone().map(libsql::Value::from).unwrap_or(libsql::Value::Null),
             practice.questions.clone().into(),
             practice.pdf_path.clone().map(libsql::Value::from).unwrap_or(libsql::Value::Null),
             practice.created_at.into(),
         ];
         conn.execute(
-            "INSERT INTO practice_sets (id, summary_id, subject, questions, pdf_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO practice_sets (id, summary_id, subject, requirements, questions, pdf_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             libsql::params_from_iter(param_values),
         ).await?;
         tracing::info!(id = %practice.id, "练习集已保存");
@@ -412,5 +504,18 @@ fn row_to_summary(row: &libsql::Row) -> Result<Summary> {
         detail: row.get::<String>(8)?,
         related_error_ids: row.get::<String>(9)?,
         created_at: row.get::<i64>(10)?,
+    })
+}
+
+/// 从 Row 构造 PracticeSet
+fn row_to_practice_set(row: &libsql::Row) -> Result<PracticeSet> {
+    Ok(PracticeSet {
+        id: row.get::<String>(0)?,
+        summary_id: row.get::<String>(1)?,
+        subject: row.get::<String>(2)?,
+        requirements: row.get::<Option<String>>(3)?,
+        questions: row.get::<String>(4)?,
+        pdf_path: row.get::<Option<String>>(5)?,
+        created_at: row.get::<i64>(6)?,
     })
 }

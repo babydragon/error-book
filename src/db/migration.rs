@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS practice_sets (
     id TEXT PRIMARY KEY,
     summary_id TEXT NOT NULL REFERENCES summaries(id),
     subject TEXT NOT NULL,
+    requirements TEXT,
     questions TEXT NOT NULL,
     pdf_path TEXT,
     created_at INTEGER NOT NULL
@@ -65,6 +66,28 @@ CREATE INDEX IF NOT EXISTS idx_error_image_embedding ON error_records(libsql_vec
 pub async fn run_migration(db: &libsql::Database) -> Result<()> {
     let conn = db.connect()?;
     conn.execute_batch(MIGRATION_SQL).await?;
+    ensure_practice_requirements_column(&conn).await?;
     tracing::info!("数据库迁移完成");
+    Ok(())
+}
+
+async fn ensure_practice_requirements_column(conn: &libsql::Connection) -> Result<()> {
+    let mut rows = conn.query("PRAGMA table_info(practice_sets)", ()).await?;
+    let mut has_requirements = false;
+
+    while let Some(row) = rows.next().await? {
+        let name: String = row.get(1)?;
+        if name == "requirements" {
+            has_requirements = true;
+            break;
+        }
+    }
+
+    if !has_requirements {
+        conn.execute("ALTER TABLE practice_sets ADD COLUMN requirements TEXT", ())
+            .await?;
+        tracing::info!("已为 practice_sets 添加 requirements 列");
+    }
+
     Ok(())
 }

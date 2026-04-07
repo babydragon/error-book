@@ -13,6 +13,7 @@
 | 生成阶段性总结 | ✅ | ✅ |
 | 生成巩固练习 | ✅ | ✅ |
 | 输出练习 PDF | ✅ | ✅ |
+| 从已存储练习集导出 PDF | ✅ | — |
 
 ## 技术栈
 
@@ -40,14 +41,18 @@ cargo zigbuild --target riscv64gc-unknown-linux-gnu --release
 创建 `config.toml`：
 
 ```toml
-[llm]
-base_url = "https://your-api-endpoint/v1"
-api_key = "your-api-key"
-chat_model = "gemini-3.1-pro-preview"
-embedding_model = "gemini-embedding-2-preview"
-embedding_dimensions = 1536
-# Google AI Studio 原生 API 地址（用于多模态 embedding）
-google_base_url = "https://your-api-endpoint"
+[llm.chat]
+provider = "openai"
+base_url = "https://your-chat-api-endpoint/v1"
+api_key = "your-chat-api-key"
+model = "gemini-3.1-pro-preview"
+
+[llm.embedding]
+provider = "google"
+base_url = "https://your-embedding-api-endpoint"
+api_key = "your-embedding-api-key"
+model = "gemini-embedding-2-preview"
+dimensions = 1536
 
 [llm.retry]
 max_attempts = 5
@@ -78,10 +83,42 @@ image_weight = 0.3
 
 | 环境变量 | 说明 |
 |---------|------|
-| `ERROR_BOOK_LLM_API_KEY` | 覆盖 `llm.api_key` |
-| `ERROR_BOOK_LLM_BASE_URL` | 覆盖 `llm.base_url` |
+| `ERROR_BOOK_CHAT_API_KEY` | 覆盖 `llm.chat.api_key` |
+| `ERROR_BOOK_EMBEDDING_API_KEY` | 覆盖 `llm.embedding.api_key` |
+| `ERROR_BOOK_CHAT_BASE_URL` | 覆盖 `llm.chat.base_url` |
+| `ERROR_BOOK_CHAT_PROVIDER` | 覆盖 `llm.chat.provider`（`google`/`openai`） |
+| `ERROR_BOOK_EMBEDDING_BASE_URL` | 覆盖 `llm.embedding.base_url` |
+| `ERROR_BOOK_EMBEDDING_PROVIDER` | 覆盖 `llm.embedding.provider`（`google`/`openai`） |
+| `ERROR_BOOK_LLM_API_KEY` | 同时覆盖 `llm.chat.api_key` 和 `llm.embedding.api_key` |
+| `ERROR_BOOK_LLM_BASE_URL` | 同时覆盖 `llm.chat.base_url` 和 `llm.embedding.base_url` |
 | `ERROR_BOOK_DB_URL` | 覆盖 `database.url` |
-| `ERROR_BOOK_GOOGLE_BASE_URL` | 覆盖 `llm.google_base_url` |
+
+说明：
+- chat 和 embedding 现在可以分别配置不同来源的 `base_url`、`api_key` 和 `model`
+- `llm.chat.provider` 用于选择 chat 协议，支持 `openai` / `google`
+- `llm.embedding.provider` 用于选择 embedding 协议，目前支持 `google` / `openai`
+- `llm.retry` 仍然是两者共用
+- chat: `openai` 与 `google` 都已实现
+- embedding: 当前仅 `provider = "google"` 已实现；`openai` 预留但暂未实现
+- 当 `provider = "google"` 时，`base_url` 应填写 Google 原生接口根地址，而不是 `/openai/` 兼容地址
+
+Chat 配置示例：
+
+```toml
+# OpenAI 兼容模式（默认）
+[llm.chat]
+provider = "openai"
+base_url = "https://your-openai-compatible-endpoint/v1"
+api_key = "your-chat-api-key"
+model = "gemini-3.1-pro-preview"
+
+# Google AI Studio 原生模式
+[llm.chat]
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-google-api-key"
+model = "gemini-3.1-pro-preview"
+```
 
 ### 字体准备
 
@@ -158,6 +195,43 @@ error-book list -s 数学
 error-book list --from 2025-03-01 --to 2025-03-31 -s 数学
 ```
 
+### 列出总结记录
+
+```bash
+error-book list-summaries [选项]
+```
+
+| 选项 | 说明 |
+|------|------|
+| `-s, --subject <科目>` | 按科目筛选 |
+| `-l, --limit <数量>` | 返回条数限制（默认 20） |
+
+示例：
+
+```bash
+error-book list-summaries
+error-book list-summaries -s 数学 -l 10
+```
+
+### 列出练习题记录
+
+```bash
+error-book list-practices [选项]
+```
+
+| 选项 | 说明 |
+|------|------|
+| `-s, --subject <科目>` | 按科目筛选 |
+| `--summary-id <ID>` | 按总结记录筛选 |
+| `-l, --limit <数量>` | 返回条数限制（默认 20） |
+
+示例：
+
+```bash
+error-book list-practices
+error-book list-practices -s 语文 --summary-id abc12345-... -l 10
+```
+
 ### 语义搜索错题
 
 支持三种搜索模式：纯文本、纯图片、混合搜索（文本+图片）。
@@ -222,6 +296,7 @@ error-book practice [选项]
 |------|------|
 | `--summary-id <ID>` | 总结记录 ID（必填） |
 | `-n, --count <数量>` | 题目数量（默认 10） |
+| `-r, --requirements <文本>` | 额外要求，如题型、难度、特殊限制 |
 | `-o, --output <路径>` | PDF 输出路径（不指定则仅输出到终端） |
 
 示例：
@@ -232,6 +307,31 @@ error-book practice --summary-id abc12345-...
 
 # 生成并导出 PDF
 error-book practice --summary-id abc12345-... -n 15 -o ./practice.pdf
+
+# 生成指定题型/难度的练习题
+error-book practice --summary-id abc12345-... -r "偏重阅读理解，难度中等，不要选择题"
+```
+
+说明：通过 `--requirements` 提供的额外要求会参与出题提示词，并随该次练习记录一起保存到数据库中。
+
+### 从已存储练习集生成 PDF
+
+从已保存的练习集重新生成或导出 PDF，无需调用 LLM。
+
+```bash
+error-book practice-pdf [选项]
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--id <练习集ID>` | 练习集 ID（必填） |
+| `-o, --output <路径>` | PDF 输出路径（必填） |
+
+示例：
+
+```bash
+# 从已存储的练习集生成 PDF
+error-book practice-pdf --id abc12345-... -o ./practice.pdf
 ```
 
 ## MCP Server
@@ -249,9 +349,12 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 | `analyze_error` | 分析错题图片 |
 | `show_error` | 查看错题详情 |
 | `list_errors` | 列出错题记录 |
+| `list_summaries` | 列出已生成的总结记录 |
+| `list_practices` | 列出已生成的练习题记录 |
 | `search_errors` | 语义搜索错题 |
 | `generate_summary` | 生成阶段性总结 |
-| `generate_practice` | 生成巩固练习题 |
+| `generate_practice` | 生成巩固练习题（支持额外要求） |
+| `generate_practice_pdf` | 按已有练习集 ID 导出 PDF |
 
 ### 在客户端中配置
 
@@ -486,7 +589,7 @@ LLM 返回 markdown + JSON 混合格式，解析策略：
 
 Chat 和 Embedding 使用不同 API 格式：
 - **Chat**：标准 OpenAI `/v1/chat/completions` 格式
-- **Embedding**：Google AI Studio 原生 `embedContent` 格式（支持多模态输入），需要独立的 `google_base_url` 配置
+- **Embedding**：由 `llm.embedding.provider` 决定；当前已实现 `google`，使用 Google AI Studio 原生 `embedContent` 格式（支持多模态输入）
 
 #### 图片存储
 

@@ -117,8 +117,36 @@ pub struct PracticeParams {
     pub summary_id: String,
     /// 题目数量（默认10）
     pub count: Option<u32>,
+    /// 额外要求（如题型、难度、特殊限制等）
+    pub requirements: Option<String>,
     /// PDF 输出路径（可选，不指定则仅返回文本）
     pub output_path: Option<String>,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct ListSummariesParams {
+    /// 按科目筛选（可选）
+    pub subject: Option<String>,
+    /// 返回条数限制（默认20）
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct ListPracticesParams {
+    /// 按科目筛选（可选）
+    pub subject: Option<String>,
+    /// 按总结记录筛选（可选）
+    pub summary_id: Option<String>,
+    /// 返回条数限制（默认20）
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct PracticePdfParams {
+    /// 练习集 ID
+    pub practice_id: String,
+    /// PDF 输出路径
+    pub output_path: String,
 }
 
 // ============ Tool implementations ============
@@ -221,6 +249,83 @@ impl McpHandler {
         }
     }
 
+    #[tool(description = "列出阶段性总结：按科目筛选已生成的总结记录")]
+    async fn list_summaries(&self, params: Parameters<ListSummariesParams>) -> String {
+        let params = params.0;
+        let repo = self.repository();
+        let limit = params.limit.unwrap_or(20);
+
+        match repo.list_summaries(params.subject.as_deref(), Some(limit)).await {
+            Ok(summaries) => {
+                if summaries.is_empty() {
+                    "没有找到总结记录".to_string()
+                } else {
+                    let mut result = format!("共 {} 条总结记录：\n\n", summaries.len());
+                    for s in &summaries {
+                        let created = chrono::DateTime::from_timestamp(s.created_at, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let from = chrono::DateTime::from_timestamp(s.period_start, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let to = chrono::DateTime::from_timestamp(s.period_end, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let short_id = &s.id[..8.min(s.id.len())];
+                        result.push_str(&format!(
+                            "{} | {} | {} | {}~{} | {}\n",
+                            short_id, s.subject, s.period_type, from, to, created
+                        ));
+                    }
+                    result
+                }
+            }
+            Err(e) => format!("查询失败: {}", e),
+        }
+    }
+
+    #[tool(description = "列出已生成的练习题：按科目或总结 ID 筛选练习记录")]
+    async fn list_practices(&self, params: Parameters<ListPracticesParams>) -> String {
+        let params = params.0;
+        let repo = self.repository();
+        let limit = params.limit.unwrap_or(20);
+
+        match repo
+            .list_practice_sets(params.subject.as_deref(), params.summary_id.as_deref(), Some(limit))
+            .await
+        {
+            Ok(practices) => {
+                if practices.is_empty() {
+                    "没有找到练习题记录".to_string()
+                } else {
+                    let mut result = format!("共 {} 条练习题记录：\n\n", practices.len());
+                    for p in &practices {
+                        let created = chrono::DateTime::from_timestamp(p.created_at, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default();
+                        let short_id = &p.id[..8.min(p.id.len())];
+                        let short_summary_id = &p.summary_id[..8.min(p.summary_id.len())];
+                        let questions: Vec<PracticeQuestion> =
+                            serde_json::from_str(&p.questions).unwrap_or_default();
+                        let pdf_status = if p.pdf_path.is_some() { "有PDF" } else { "无PDF" };
+                        result.push_str(&format!(
+                            "{} | 总结:{} | {} | {}题 | 要求:{} | {} | {}\n",
+                            short_id,
+                            short_summary_id,
+                            p.subject,
+                            questions.len(),
+                            p.requirements.as_deref().unwrap_or("-"),
+                            pdf_status,
+                            created
+                        ));
+                    }
+                    result
+                }
+            }
+            Err(e) => format!("查询失败: {}", e),
+        }
+    }
+
     #[tool(description = "语义搜索错题：通过自然语言描述搜索相关错题记录")]
     async fn search_errors(&self, params: Parameters<SearchParams>) -> String {
         let params = params.0;
@@ -310,7 +415,10 @@ impl McpHandler {
             self.repository(),
         );
 
-        match generator.generate(&params.summary_id, count, None).await {
+        match generator
+            .generate(&params.summary_id, count, params.requirements.as_deref(), None)
+            .await
+        {
             Ok(practice) => {
                 let questions: Vec<PracticeQuestion> =
                     serde_json::from_str(&practice.questions).unwrap_or_default();
@@ -318,6 +426,9 @@ impl McpHandler {
                     "练习生成完成\nID: {}\n总结 ID: {}\n科目: {}\n题目数: {}\n\n",
                     practice.id, practice.summary_id, practice.subject, questions.len()
                 );
+                if let Some(req) = practice.requirements.as_deref() {
+                    result.push_str(&format!("额外要求: {}\n\n", req));
+                }
                 for (i, q) in questions.iter().enumerate() {
                     result.push_str(&format!(
                         "第 {} 题\n{}\n答案: {}\n知识点: {}\n\n",
@@ -337,13 +448,42 @@ impl McpHandler {
             Err(e) => format!("练习生成失败: {}", e),
         }
     }
+
+    #[tool(description = "为已生成的练习集导出 PDF：根据 practice_id 重新生成 PDF，不调用 LLM")]
+    async fn generate_practice_pdf(&self, params: Parameters<PracticePdfParams>) -> String {
+        let params = params.0;
+        let repo = self.repository();
+
+        match repo.get_practice_set(&params.practice_id).await {
+            Ok(Some(practice)) => match crate::pdf::generate_pdf(&practice, &params.output_path) {
+                Ok(pdf_out) => {
+                    if let Err(e) = repo
+                        .update_practice_set_pdf_path(&params.practice_id, &pdf_out.path)
+                        .await
+                    {
+                        return format!(
+                            "PDF 已生成: {}\n但更新数据库中的 pdf_path 失败: {}",
+                            pdf_out.path, e
+                        );
+                    }
+                    format!(
+                        "练习集 PDF 生成完成\nID: {}\n科目: {}\n输出路径: {}",
+                        practice.id, practice.subject, pdf_out.path
+                    )
+                }
+                Err(e) => format!("PDF 生成失败: {}", e),
+            },
+            Ok(None) => format!("未找到练习集: {}", params.practice_id),
+            Err(e) => format!("查询失败: {}", e),
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::default()
-            .with_instructions("错题本 AI 助手：可以分析错题图片、查看/搜索错题记录、生成阶段性总结、生成巩固练习题（支持 PDF 输出）。")
+            .with_instructions("错题本 AI 助手：可以分析错题图片、查看/搜索错题记录、列出总结和练习记录、生成阶段性总结、生成巩固练习题，以及为已有练习导出 PDF。")
     }
 }
 

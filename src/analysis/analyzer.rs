@@ -87,6 +87,12 @@ impl Analyzer {
             .await?;
         tracing::info!(dimensions = text_embedding.len(), "文本 Embedding 生成完成");
 
+        if !self.embedding_client.supports_image_embedding() {
+            anyhow::bail!(
+                "当前 embedding provider 不支持图片 embedding；analyze 需要 llm.embedding.provider=google"
+            );
+        }
+
         tracing::info!("开始生成图片 embedding...");
         let image_embedding = self.embedding_client
             .embed_image_only(&image_base64, media_type)

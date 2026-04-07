@@ -1,12 +1,15 @@
-[llm]
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-api_key = "your-api-key"
-chat_model = "gemini-3.1-pro-preview"
-embedding_model = "gemini-embedding-2-preview"
-embedding_dimensions = 1536
-# Google AI Studio API base URL（用于 embedding 等需要原生 Google 格式的接口）
-# 默认从 base_url 自动推导（去掉 /openai/ 后缀），也可显式指定
-# google_base_url = "https://generativelanguage.googleapis.com"
+[llm.chat]
+provider = "openai"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "your-chat-api-key"
+model = "gemini-3.1-pro-preview"
+
+[llm.embedding]
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-embedding-api-key"
+model = "gemini-embedding-2-preview"
+dimensions = 1536
 
 [llm.retry]
 max_attempts = 5

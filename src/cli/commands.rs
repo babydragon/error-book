@@ -63,6 +63,29 @@ pub enum Command {
         limit: u32,
     },
 
+    /// 列出阶段性总结
+    ListSummaries {
+        /// 按科目筛选
+        #[arg(short, long)]
+        subject: Option<String>,
+        /// 返回条数限制
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+    },
+
+    /// 列出已生成的练习题
+    ListPractices {
+        /// 按科目筛选
+        #[arg(short, long)]
+        subject: Option<String>,
+        /// 按总结记录筛选
+        #[arg(long)]
+        summary_id: Option<String>,
+        /// 返回条数限制
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+    },
+
     /// 语义搜索错题
     Search {
         /// 搜索文本
@@ -106,9 +129,22 @@ pub enum Command {
         /// 题目数量
         #[arg(short = 'n', long, default_value = "10")]
         count: u32,
+        /// 额外要求（如题型、难度、特殊限制等）
+        #[arg(short = 'r', long)]
+        requirements: Option<String>,
         /// PDF 输出路径
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// 从已存储的练习集重新生成 PDF（不调用 LLM）
+    PracticePdf {
+        /// 练习集 ID
+        #[arg(long)]
+        id: String,
+        /// PDF 输出路径
+        #[arg(short, long)]
+        output: PathBuf,
     },
 
     /// 启动 MCP Server (stdio 模式)

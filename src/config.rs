@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,18 +17,73 @@ pub struct AppConfig {
     pub search: SearchConfig,
 }
 
+/// Chat LLM provider configuration (independent from embedding)
+#[derive(Deserialize, Clone)]
+pub struct ChatProviderConfig {
+    #[serde(default)]
+    pub provider: ChatProvider,
+    pub base_url: String,
+    #[serde(skip_serializing)]
+    pub api_key: String,
+    pub model: String,
+}
+
+impl fmt::Debug for ChatProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatProviderConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatProvider {
+    #[default]
+    Openai,
+    Google,
+}
+
+/// Embedding LLM provider configuration (independent from chat)
+#[derive(Deserialize, Clone)]
+pub struct EmbeddingProviderConfig {
+    #[serde(default)]
+    pub provider: EmbeddingProvider,
+    pub base_url: String,
+    #[serde(skip_serializing)]
+    pub api_key: String,
+    pub model: String,
+    #[serde(default = "default_embedding_dimensions")]
+    pub dimensions: u32,
+}
+
+impl fmt::Debug for EmbeddingProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmbeddingProviderConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("dimensions", &self.dimensions)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingProvider {
+    Openai,
+    #[default]
+    Google,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct LlmConfig {
-    pub base_url: String,
-    pub api_key: String,
-    pub chat_model: String,
-    pub embedding_model: String,
-    #[serde(default = "default_embedding_dimensions")]
-    pub embedding_dimensions: u32,
-    /// Google AI Studio API base URL（用于 embedding 等需要原生 Google 格式的接口）
-    /// 默认使用 base_url 去掉 /openai/ 后缀
-    #[serde(default)]
-    pub google_base_url: Option<String>,
+    pub chat: ChatProviderConfig,
+    pub embedding: EmbeddingProviderConfig,
     #[serde(default)]
     pub retry: RetryConfig,
 }
@@ -160,16 +216,44 @@ impl AppConfig {
         // 环境变量覆盖
         let mut config = config;
         if let Ok(v) = std::env::var("ERROR_BOOK_LLM_API_KEY") {
-            config.llm.api_key = v;
+            config.llm.chat.api_key = v.clone();
+            config.llm.embedding.api_key = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_CHAT_API_KEY") {
+            config.llm.chat.api_key = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_EMBEDDING_API_KEY") {
+            config.llm.embedding.api_key = v;
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_LLM_BASE_URL") {
-            config.llm.base_url = v;
+            config.llm.chat.base_url = v.clone();
+            config.llm.embedding.base_url = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_CHAT_BASE_URL") {
+            config.llm.chat.base_url = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_CHAT_PROVIDER") {
+            config.llm.chat.provider = match v.to_ascii_lowercase().as_str() {
+                "google" => ChatProvider::Google,
+                "openai" => ChatProvider::Openai,
+                other => anyhow::bail!("不支持的 chat provider: {}，仅支持 google/openai", other),
+            };
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_EMBEDDING_BASE_URL") {
+            config.llm.embedding.base_url = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_EMBEDDING_PROVIDER") {
+            config.llm.embedding.provider = match v.to_ascii_lowercase().as_str() {
+                "google" => EmbeddingProvider::Google,
+                "openai" => EmbeddingProvider::Openai,
+                other => anyhow::bail!(
+                    "不支持的 embedding provider: {}，仅支持 google/openai",
+                    other
+                ),
+            };
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_DB_URL") {
             config.database.url = v;
-        }
-        if let Ok(v) = std::env::var("ERROR_BOOK_GOOGLE_BASE_URL") {
-            config.llm.google_base_url = Some(v);
         }
 
         Ok(config)
@@ -178,41 +262,15 @@ impl AppConfig {
     pub fn chat_api_url(&self) -> String {
         format!(
             "{}/chat/completions",
-            self.llm.base_url.trim_end_matches('/')
+            self.llm.chat.base_url.trim_end_matches('/')
         )
     }
 
     pub fn embeddings_api_url(&self) -> String {
-        format!("{}/embeddings", self.llm.base_url.trim_end_matches('/'))
-    }
-
-    /// Google AI Studio embedContent endpoint
-    /// 格式: {google_base_url}/v1beta/models/{model}:embedContent
-    pub fn google_embed_url(&self) -> String {
-        let base = self.google_base_url();
-        let model = &self.llm.embedding_model;
         format!(
-            "{}/v1beta/models/{}:embedContent",
-            base.trim_end_matches('/'),
-            model
+            "{}/embeddings",
+            self.llm.embedding.base_url.trim_end_matches('/')
         )
-    }
-
-    /// 获取 Google AI Studio API base URL
-    /// 如果配置了 google_base_url 则使用，否则从 base_url 推导（去掉 /openai/ 等后缀）
-    fn google_base_url(&self) -> String {
-        if let Some(ref url) = self.llm.google_base_url {
-            return url.clone();
-        }
-        // 从 base_url 推导：去掉末尾的路径段（如 /v1beta/openai/ → 取根）
-        let url = self.llm.base_url.trim_end_matches('/');
-        // 常见模式: https://xxx.com/v1beta/openai → https://xxx.com
-        // 或: https://xxx.com/v1/openai → https://xxx.com
-        if let Some(idx) = url.find("/openai") {
-            url[..idx].to_string()
-        } else {
-            url.to_string()
-        }
     }
 
     /// 确保存储目录存在

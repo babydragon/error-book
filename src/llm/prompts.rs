@@ -1,6 +1,8 @@
 use crate::config::AppConfig;
 use crate::db::models::AnalysisRequest;
 
+use crate::analysis::parser::PracticeQuestion;
+
 /// 构建错题分析 Prompt
 pub fn build_analysis_prompt(
     config: &AppConfig,
@@ -103,27 +105,114 @@ pub fn build_practice_prompt(
     weak_points: &[String],
     reference_questions: &str,
     count: u32,
+    requirements: Option<&str>,
 ) -> Vec<super::client::ChatMessage> {
     let system = format!(
         r#"你是一个经验丰富的小学{}教师。请根据学生的薄弱知识点和参考题目风格，生成新的巩固练习题。
 
-要求：
+内容要求：
 1. 题目必须覆盖给定的薄弱知识点
 2. 题目风格参考给出的原题，但不要重复原题
 3. 题目适合{}学生
-4. 每道题包含题目内容和参考答案
+4. 每道题都必须包含题目内容、参考答案、知识点
 
-输出严格采用JSON格式，输出一个数组，每个元素包含：
-- question: 字符串，题目内容（markdown格式）
-- answer: 字符串，参考答案
-- knowledge_points: 字符串数组，考查的知识点"#,
-        subject, grade_level
+输出格式要求（非常重要）：
+1. 只输出 JSON，不要输出任何解释、说明、前后缀、标题、备注
+2. 不要使用 markdown 代码块，不要输出 ```json
+3. 输出必须是一个 JSON 数组
+4. 第一个字符必须是 [，最后一个字符必须是 ]
+5. 必须且只能输出 {} 个对象，不能多也不能少
+6. 每个对象必须且只能包含以下 3 个字段：
+   - question: 字符串，题目内容，允许使用 markdown，但必须作为 JSON 字符串输出
+   - answer: 字符串，参考答案
+   - knowledge_points: 字符串数组，表示该题考查的知识点
+7. 所有字段名必须完全一致，不能增加其他字段，不能省略字段
+8. 如果 question 中需要换行，请使用 \n；如果内容中出现英文双引号，必须正确转义为 \"
+9. knowledge_points 必须是 JSON 字符串数组，即使只有 1 个知识点也必须输出数组
+10. 不要输出任何 emoji、表情符号、贴纸风格符号或装饰性 pictograph，不要使用 ✅📚⭐🎯😀 等字符
+
+输出示例：
+[
+  {{
+    "question": "1. 计算：12 ÷ 3 = ?",
+    "answer": "4",
+    "knowledge_points": ["表内除法"]
+  }}
+]"#,
+        subject, grade_level, count
     );
 
+    let extra_requirements = requirements
+        .map(|r| {
+            format!(
+                "\n\n额外要求：\n{}\n\n注意：额外要求不能改变题目数量、JSON 输出格式和必需字段。",
+                r
+            )
+        })
+        .unwrap_or_default();
+
     let user = format!(
-        "薄弱知识点：{}\n\n参考题目风格：\n{}\n\n请生成 {} 道巩固练习题。",
+        "薄弱知识点：{}\n\n参考题目风格：\n{}{}\n\n请生成 {} 道巩固练习题。请再次确认：最终回复只能是合法 JSON 数组，且数组长度必须恰好为 {}。",
         weak_points.join("、"),
         reference_questions,
+        extra_requirements,
+        count,
+        count
+    );
+
+    vec![
+        super::client::ChatMessage::system(&system),
+        super::client::ChatMessage::user_text(&user),
+    ]
+}
+
+/// 当首次生成题量不足时，补生成剩余练习题
+pub fn build_practice_fill_prompt(
+    subject: &str,
+    grade_level: &str,
+    weak_points: &[String],
+    existing_questions: &[PracticeQuestion],
+    count: u32,
+    requirements: Option<&str>,
+) -> Vec<super::client::ChatMessage> {
+    let system = format!(
+        r#"你是一个经验丰富的小学{}教师。现在需要补生成剩余的巩固练习题。
+
+内容要求：
+1. 题目必须覆盖给定的薄弱知识点
+2. 题目适合{}学生
+3. 不要重复已有题目，不要改写已有题目
+4. 优先保证题量足够；如果 token 紧张，请缩短题干和答案，不要少题
+
+输出格式要求（非常重要）：
+1. 只输出 JSON，不要输出任何解释、说明、前后缀、标题、备注
+2. 不要使用 markdown 代码块，不要输出 ```json
+3. 输出必须是一个 JSON 数组
+4. 第一个字符必须是 [，最后一个字符必须是 ]
+5. 必须且只能输出 {} 个对象，不能多也不能少
+6. 每个对象必须且只能包含以下 3 个字段：question、answer、knowledge_points
+7. question 与 answer 尽量简洁；如果需要换行请使用 \n；双引号必须转义为 \"
+8. knowledge_points 必须是字符串数组
+9. 不要输出任何 emoji、表情符号、贴纸风格符号或装饰性 pictograph，不要使用 ✅📚⭐🎯😀 等字符"#,
+        subject, grade_level, count
+    );
+
+    let existing_json = serde_json::to_string(existing_questions).unwrap_or_default();
+    let extra_requirements = requirements
+        .map(|r| {
+            format!(
+                "\n\n额外要求：\n{}\n\n注意：额外要求不能改变题目数量、JSON 输出格式和必需字段。",
+                r
+            )
+        })
+        .unwrap_or_default();
+
+    let user = format!(
+        "薄弱知识点：{}\n\n以下题目已经生成，禁止重复：\n{}{}\n\n现在请只补生成剩余 {} 道新题。最终回复只能是合法 JSON 数组，且数组长度必须恰好为 {}。",
+        weak_points.join("、"),
+        existing_json,
+        extra_requirements,
+        count,
         count
     );
 

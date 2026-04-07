@@ -72,6 +72,7 @@ pub struct PracticeSet {
     pub id: String,
     pub summary_id: String,
     pub subject: String,
+    pub requirements: Option<String>,
     /// JSON 数组 [{question, answer, ...}]
     pub questions: String,
     pub pdf_path: Option<String>,

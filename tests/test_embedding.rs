@@ -46,10 +46,10 @@ async fn test_embedding_e2e() {
     let embedding = client.embed(test_text).await.expect("Embedding API 调用失败");
     println!("\n✅ Embedding 生成成功");
     println!("   返回维度: {}", embedding.len());
-    println!("   期望维度: {}", config.llm.embedding_dimensions);
+    println!("   期望维度: {}", config.llm.embedding.dimensions);
     println!("   前5个值: {:?}", &embedding[..5.min(embedding.len())]);
     assert!(!embedding.is_empty(), "Embedding 不应为空");
-    println!("   实际维度: {}, 配置维度: {}", embedding.len(), config.llm.embedding_dimensions);
+    println!("   实际维度: {}, 配置维度: {}", embedding.len(), config.llm.embedding.dimensions);
     let norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
     assert!(norm > 0.0);
     println!("\n🎉 纯文本 Embedding 端到端测试通过！");
@@ -87,6 +87,10 @@ async fn test_embedding_similarity() {
 async fn test_multimodal_embedding_with_image() {
     let Some(config) = load_config() else { return };
     let client = EmbeddingClient::new(&config);
+    if !client.supports_image_embedding() {
+        eprintln!("⚠️  跳过：当前 provider 不支持多模态 embedding");
+        return;
+    }
     let image_path = std::path::Path::new("tests/wrong_1.png");
     if !image_path.exists() {
         eprintln!("⚠️  跳过：测试图片不存在");
@@ -102,7 +106,7 @@ async fn test_multimodal_embedding_with_image() {
         Ok(embedding) => {
             println!("✅ 成功！维度: {}", embedding.len());
             assert!(!embedding.is_empty(), "Embedding 不应为空");
-            println!("   实际维度: {}, 配置维度: {}", embedding.len(), config.llm.embedding_dimensions);
+            println!("   实际维度: {}, 配置维度: {}", embedding.len(), config.llm.embedding.dimensions);
         }
         Err(e) => {
             println!("❌ 多模态 embedding 失败: {}", e);
@@ -115,6 +119,10 @@ async fn test_multimodal_embedding_with_image() {
 async fn test_multimodal_embedding_image_only() {
     let Some(config) = load_config() else { return };
     let client = EmbeddingClient::new(&config);
+    if !client.supports_image_embedding() {
+        eprintln!("⚠️  跳过：当前 provider 不支持图片 embedding");
+        return;
+    }
     let image_path = std::path::Path::new("tests/wrong_1.png");
     if !image_path.exists() {
         eprintln!("⚠️  跳过：测试图片不存在");

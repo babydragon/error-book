@@ -150,12 +150,70 @@ async fn main() -> Result<()> {
             if records.is_empty() {
                 println!("没有找到错题记录");
             } else {
-                println!("共 {} 条错题记录：", records.len());
-                println!("────────────────────────────────────────────────");
+                println!("共 {} 条错题记录：\n", records.len());
                 for r in &records {
-                    let date = format_timestamp(r.created_at);
-                    let short_id = &r.id[..8.min(r.id.len())];
-                    println!("  {} | {} | {} | {}", short_id, r.subject, truncate(&r.classification, 30), date);
+                    let date = chrono::DateTime::from_timestamp(r.created_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_default();
+                    let tags: Vec<String> = serde_json::from_str(&r.classification).unwrap_or_default();
+                    let tags_display = tags.join("、");
+                    println!("{} | {} | {} | {}", r.id, r.subject, truncate(&tags_display, 24), date);
+                }
+            }
+        }
+
+        Command::ListSummaries { subject, limit } => {
+            let summaries = repository.list_summaries(subject.as_deref(), Some(limit)).await?;
+
+            if summaries.is_empty() {
+                println!("没有找到总结记录");
+            } else {
+                println!("共 {} 条总结记录：\n", summaries.len());
+                for s in &summaries {
+                    let created_at = format_timestamp(s.created_at);
+                    let from_str = chrono::DateTime::from_timestamp(s.period_start, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    let to_str = chrono::DateTime::from_timestamp(s.period_end, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    println!(
+                        "{} | {} | {} | {}~{} | {}",
+                        s.id,
+                        s.subject,
+                        s.period_type,
+                        from_str,
+                        to_str,
+                        created_at
+                    );
+                }
+            }
+        }
+
+        Command::ListPractices { subject, summary_id, limit } => {
+            let practices = repository
+                .list_practice_sets(subject.as_deref(), summary_id.as_deref(), Some(limit))
+                .await?;
+
+            if practices.is_empty() {
+                println!("没有找到练习题记录");
+            } else {
+                println!("共 {} 条练习题记录：\n", practices.len());
+                for p in &practices {
+                    let created_at = format_timestamp(p.created_at);
+                    let questions: Vec<error_book::analysis::parser::PracticeQuestion> =
+                        serde_json::from_str(&p.questions).unwrap_or_default();
+                    let pdf_status = p.pdf_path.as_deref().unwrap_or("-");
+                    println!(
+                        "{} | {} | {} | {}题 | {} | {} | {}",
+                        p.id,
+                        truncate(&p.summary_id, 12),
+                        p.subject,
+                        questions.len(),
+                        truncate(p.requirements.as_deref().unwrap_or("-"), 20),
+                        truncate(pdf_status, 24),
+                        created_at
+                    );
                 }
             }
         }
@@ -167,6 +225,12 @@ async fn main() -> Result<()> {
             }
 
             let query_text = query.as_deref().unwrap_or("");
+
+            if image.is_some() && !embedding_client.supports_image_embedding() {
+                anyhow::bail!(
+                    "当前 embedding provider 不支持图片搜索；请将 llm.embedding.provider 设置为 google"
+                );
+            }
 
             // 有图片输入时，读取图片
             let image_data: Option<(String, &'static str)> = if let Some(ref image_path) = image {
@@ -228,11 +292,12 @@ async fn main() -> Result<()> {
                 for r in &results {
                     let record = &r.record;
                     let similarity = r.similarity();
-                    let short_id = &record.id[..8.min(record.id.len())];
                     let question_one_line = record.original_question.replace('\n', " ");
                     let reason_one_line = record.error_reason.replace('\n', " ");
+                    let tags: Vec<String> = serde_json::from_str(&record.classification).unwrap_or_default();
+                    let tags_display = tags.join("、");
 
-                    println!("  {} | 相似度: {:.4} | {} | {}", short_id, similarity, record.subject, record.classification);
+                    println!("{} | {:.4} | {} | {}", record.id, similarity, record.subject, truncate(&tags_display, 20));
                     if !record.image_path.is_empty() {
                         println!("    图片: {}", image_storage.full_path(&record.image_path).display());
                     }
@@ -289,7 +354,7 @@ async fn main() -> Result<()> {
             println!("{}", summary.detail);
         }
 
-        Command::Practice { summary_id, count, output } => {
+        Command::Practice { summary_id, count, requirements, output } => {
             let generator = PracticeGenerator::new(
                 config,
                 chat_client,
@@ -300,6 +365,7 @@ async fn main() -> Result<()> {
             let practice = generator.generate(
                 &summary_id,
                 count,
+                requirements.as_deref(),
                 pdf_path_str.as_deref(),
             ).await?;
 
@@ -313,6 +379,9 @@ async fn main() -> Result<()> {
             println!("总结 ID:  {}", practice.summary_id);
             println!("科目:     {}", practice.subject);
             println!("题目数:   {}", questions.len());
+            if let Some(req) = practice.requirements.as_deref() {
+                println!("额外要求: {}", req);
+            }
             println!();
 
             for (i, q) in questions.iter().enumerate() {
@@ -328,6 +397,25 @@ async fn main() -> Result<()> {
                 let pdf_output = error_book::pdf::generate_pdf(&practice, &output_path.to_string_lossy())?;
                 println!("📄 PDF 已生成: {}", pdf_output.path);
             }
+        }
+
+        Command::PracticePdf { id, output } => {
+            let practice = repository.get_practice_set(&id).await?
+                .ok_or_else(|| anyhow::anyhow!("练习集不存在: {}", id))?;
+
+            let questions: Vec<error_book::analysis::parser::PracticeQuestion> =
+                serde_json::from_str(&practice.questions).unwrap_or_default();
+
+            println!("正在从已存储的练习集生成 PDF...");
+            println!("练习 ID:  {}", practice.id);
+            println!("科目:     {}", practice.subject);
+            println!("题目数:   {}", questions.len());
+
+            let pdf_output = error_book::pdf::generate_pdf(&practice, &output.to_string_lossy())?;
+            println!("📄 PDF 已生成: {}", pdf_output.path);
+
+            // 更新数据库中的 pdf_path
+            repository.update_practice_set_pdf_path(&id, &pdf_output.path).await?;
         }
 
         Command::Mcp => {
