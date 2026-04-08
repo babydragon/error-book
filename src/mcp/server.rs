@@ -518,7 +518,7 @@ impl McpHandler {
                 let questions: Vec<PracticeQuestion> = serde_json::from_str(&practice.questions).unwrap_or_default();
                 let mut pdf_path = practice.pdf_path.clone();
                 if let Some(ref path) = params.output_path {
-                    match crate::pdf::generate_pdf(&practice, path) {
+                    match crate::pdf::generate_pdf(&practice, &self.config.pdf, path) {
                         Ok(pdf_out) => pdf_path = Some(pdf_out.path),
                         Err(e) => return json_err(format!("PDF 生成失败: {}", e)),
                     }
@@ -545,7 +545,7 @@ impl McpHandler {
         let repo = self.repository();
 
         match repo.get_practice_set(&params.practice_id).await {
-            Ok(Some(practice)) => match crate::pdf::generate_pdf(&practice, &params.output_path) {
+            Ok(Some(practice)) => match crate::pdf::generate_pdf(&practice, &self.config.pdf, &params.output_path) {
                 Ok(pdf_out) => {
                     if let Err(e) = repo
                         .update_practice_set_pdf_path(&params.practice_id, &pdf_out.path)

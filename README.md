@@ -72,6 +72,7 @@ pdf_dir = "./data/pdfs"
 grade_level = "二年级"
 
 [pdf]
+# 必填：Typst 渲染使用的字体文件，程序启动时会校验其存在性与有效性
 font_path = "./fonts/NotoSansSC-Regular.ttf"
 
 [search]
@@ -101,6 +102,7 @@ image_weight = 0.3
 - chat: `openai` 与 `google` 都已实现
 - embedding: 当前仅 `provider = "google"` 已实现；`openai` 预留但暂未实现
 - 当 `provider = "google"` 时，`base_url` 应填写 Google 原生接口根地址，而不是 `/openai/` 兼容地址
+- `pdf.font_path` 为必填项；程序启动时会校验字体文件存在且可解析，不再使用默认回退字体
 
 Chat 配置示例：
 

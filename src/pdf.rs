@@ -1,4 +1,5 @@
 use crate::analysis::parser::PracticeQuestion;
+use crate::config::PdfConfig;
 use crate::db::models::PracticeSet;
 
 use chrono::{Datelike, Timelike};
@@ -17,12 +18,16 @@ pub struct PdfOutput {
 }
 
 /// 生成巩固练习 PDF（通过 Typst）
-pub fn generate_pdf(practice: &PracticeSet, pdf_path: &str) -> anyhow::Result<PdfOutput> {
+pub fn generate_pdf(
+    practice: &PracticeSet,
+    pdf_config: &PdfConfig,
+    pdf_path: &str,
+) -> anyhow::Result<PdfOutput> {
     let questions: Vec<PracticeQuestion> =
         serde_json::from_str(&practice.questions).unwrap_or_default();
 
     // 加载字体
-    let (fonts, font_family) = load_fonts()?;
+    let (fonts, font_family) = load_fonts(&pdf_config.font_path)?;
 
     // 构建 Typst 标记源码
     let markup = build_typst_markup(&questions, &practice.subject, &font_family);
@@ -136,36 +141,19 @@ impl World for TypstWorld {
 // 字体加载
 // ============================================================
 
-/// 从 fonts/ 目录加载字体文件，返回字体列表和首选字体族名
-fn load_fonts() -> anyhow::Result<(Vec<Font>, String)> {
-    let candidates = [
-        "fonts/Alibaba-PuHuiTi-Regular.otf",
-        "fonts/NotoSansSC-Regular.ttf",
-    ];
-
-    let mut fonts = Vec::new();
-
-    for path in &candidates {
-        if std::path::Path::new(path).exists() {
-            let bytes = std::fs::read(path)
-                .map_err(|e| anyhow::anyhow!("读取字体文件失败 {}: {}", path, e))?;
-            if bytes.len() < 100_000 {
-                tracing::warn!("字体文件 {} 过小 ({} bytes)，跳过", path, bytes.len());
-                continue;
-            }
-            let data = Bytes::new(bytes);
-            for font in Font::iter(data) {
-                fonts.push(font);
-            }
-        }
-    }
+/// 从配置指定路径加载字体文件，返回字体列表和首选字体族名
+fn load_fonts(path: &std::path::Path) -> anyhow::Result<(Vec<Font>, String)> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("读取字体文件失败 {}: {}", path.display(), e))?;
+    let data = Bytes::new(bytes);
+    let fonts: Vec<Font> = Font::iter(data).collect();
 
     if fonts.is_empty() {
-        anyhow::bail!("未找到有效的字体文件，请检查 fonts/ 目录");
+        anyhow::bail!("字体文件中未解析出有效字体: {}", path.display());
     }
 
     let family = fonts[0].info().family.clone();
-    tracing::debug!(family = %family, count = fonts.len(), "字体已加载");
+    tracing::debug!(family = %family, count = fonts.len(), path = %path.display(), "字体已加载");
     Ok((fonts, family))
 }
 
@@ -311,7 +299,29 @@ fn is_emoji_like(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PdfConfig;
     use crate::db::models::PracticeSet;
+    use std::path::PathBuf;
+
+    fn test_pdf_config() -> Option<PdfConfig> {
+        let candidates = [
+            "fonts/Alibaba-PuHuiTi-Regular.otf",
+            "fonts/NotoSansSC-Regular.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ];
+
+        for candidate in candidates {
+            let path = PathBuf::from(candidate);
+            if path.is_file() && load_fonts(&path).is_ok() {
+                return Some(PdfConfig { font_path: path });
+            }
+        }
+
+        None
+    }
 
     #[test]
     fn test_generate_pdf_with_sample_data() {
@@ -339,7 +349,12 @@ mod tests {
         };
 
         let output_path = "data/test_practice.pdf";
-        let result = generate_pdf(&practice, output_path);
+        let Some(pdf_config) = test_pdf_config() else {
+            eprintln!("⚠️  跳过 PDF 测试：未找到可用字体文件");
+            return;
+        };
+
+        let result = generate_pdf(&practice, &pdf_config, output_path);
         assert!(result.is_ok(), "PDF generation failed: {:?}", result.err());
 
         let pdf_bytes = std::fs::read(output_path).expect("PDF file should exist");
@@ -388,7 +403,12 @@ mod tests {
 
     #[test]
     fn test_load_fonts() {
-        let (fonts, family) = load_fonts().expect("should find fonts");
+        let Some(pdf_config) = test_pdf_config() else {
+            eprintln!("⚠️  跳过字体测试：未找到可用字体文件");
+            return;
+        };
+
+        let (fonts, family) = load_fonts(&pdf_config.font_path).expect("should find fonts");
         assert!(!fonts.is_empty(), "Should load at least one font");
         assert!(!family.is_empty(), "Font family name should not be empty");
         println!("Font family: {}, count: {}", family, fonts.len());

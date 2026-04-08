@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
     let image_storage = ImageStorage::new(config.storage.image_dir.clone());
 
     let search_config = config.search.clone();
+    let pdf_config = config.pdf.clone();
 
     match cli.command {
         Command::Analyze { .. } => {
@@ -394,7 +395,11 @@ async fn main() -> Result<()> {
 
             // 生成 PDF（如果指定了 --output）
             if let Some(ref output_path) = output {
-                let pdf_output = error_book::pdf::generate_pdf(&practice, &output_path.to_string_lossy())?;
+                let pdf_output = error_book::pdf::generate_pdf(
+                    &practice,
+                    &pdf_config,
+                    &output_path.to_string_lossy(),
+                )?;
                 println!("📄 PDF 已生成: {}", pdf_output.path);
             }
         }
@@ -411,7 +416,11 @@ async fn main() -> Result<()> {
             println!("科目:     {}", practice.subject);
             println!("题目数:   {}", questions.len());
 
-            let pdf_output = error_book::pdf::generate_pdf(&practice, &output.to_string_lossy())?;
+            let pdf_output = error_book::pdf::generate_pdf(
+                &practice,
+                &pdf_config,
+                &output.to_string_lossy(),
+            )?;
             println!("📄 PDF 已生成: {}", pdf_output.path);
 
             // 更新数据库中的 pdf_path

@@ -11,7 +11,6 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub defaults: DefaultsConfig,
-    #[serde(default)]
     pub pdf: PdfConfig,
     #[serde(default)]
     pub search: SearchConfig,
@@ -153,16 +152,7 @@ impl Default for DefaultsConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct PdfConfig {
-    #[serde(default = "default_font_path")]
     pub font_path: PathBuf,
-}
-
-impl Default for PdfConfig {
-    fn default() -> Self {
-        Self {
-            font_path: default_font_path(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -199,9 +189,6 @@ fn default_retryable_codes() -> Vec<u16> {
 }
 fn default_grade_level() -> String {
     "二年级".to_string()
-}
-fn default_font_path() -> PathBuf {
-    PathBuf::from("./fonts/NotoSansSC-Regular.ttf")
 }
 fn default_image_weight() -> f64 {
     0.3
@@ -256,6 +243,9 @@ impl AppConfig {
             config.database.url = v;
         }
 
+        config.resolve_paths(path)?;
+        config.validate()?;
+
         Ok(config)
     }
 
@@ -279,6 +269,52 @@ impl AppConfig {
             .with_context(|| format!("创建图片目录失败: {}", self.storage.image_dir.display()))?;
         std::fs::create_dir_all(&self.storage.pdf_dir)
             .with_context(|| format!("创建PDF目录失败: {}", self.storage.pdf_dir.display()))?;
+        Ok(())
+    }
+
+    fn resolve_paths(&mut self, config_path: &Path) -> Result<()> {
+        let base_dir = config_path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        if self.storage.image_dir.is_relative() {
+            self.storage.image_dir = base_dir.join(&self.storage.image_dir);
+        }
+        if self.storage.pdf_dir.is_relative() {
+            self.storage.pdf_dir = base_dir.join(&self.storage.pdf_dir);
+        }
+        if self.pdf.font_path.is_relative() {
+            self.pdf.font_path = base_dir.join(&self.pdf.font_path);
+        }
+
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_pdf_font()
+    }
+
+    fn validate_pdf_font(&self) -> Result<()> {
+        let path = &self.pdf.font_path;
+        if path.as_os_str().is_empty() {
+            anyhow::bail!("pdf.font_path 未配置");
+        }
+        if !path.exists() {
+            anyhow::bail!("PDF 字体文件不存在: {}", path.display());
+        }
+        if !path.is_file() {
+            anyhow::bail!("pdf.font_path 不是文件: {}", path.display());
+        }
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("读取 PDF 字体文件失败: {}", path.display()))?;
+        if bytes.len() < 100_000 {
+            anyhow::bail!("PDF 字体文件过小，可能无效: {}", path.display());
+        }
+        let data = typst::foundations::Bytes::new(bytes);
+        if typst::text::Font::iter(data).next().is_none() {
+            anyhow::bail!("PDF 字体文件无法解析为有效字体: {}", path.display());
+        }
         Ok(())
     }
 }
