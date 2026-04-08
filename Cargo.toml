@@ -55,5 +55,6 @@ rand = "0.10"
 rmcp = { version = "1.3", features = ["server", "macros", "transport-io"] }
 schemars = "1"
 
-# PDF 生成
-printpdf = { version = "0.9", features = ["html"] }
+# PDF 生成 (Typst)
+typst = "0.14"
+typst-pdf = "0.14"

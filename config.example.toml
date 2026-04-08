@@ -29,6 +29,8 @@ pdf_dir = "./data/pdfs"
 grade_level = "二年级"
 
 [pdf]
+# PDF 生成使用 Typst 渲染引擎，字体路径供将来扩展使用
+# 当前实际字体加载优先级：fonts/Alibaba-PuHuiTi-Regular.otf > fonts/NotoSansSC-Regular.ttf
 font_path = "./fonts/NotoSansSC-Regular.ttf"
 
 [search]

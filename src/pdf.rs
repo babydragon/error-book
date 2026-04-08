@@ -1,6 +1,14 @@
 use crate::analysis::parser::PracticeQuestion;
 use crate::db::models::PracticeSet;
-use printpdf::*;
+
+use chrono::{Datelike, Timelike};
+use typst::diag::FileError;
+use typst::foundations::{Bytes, Datetime};
+use typst::syntax::{FileId, Source, VirtualPath};
+use typst::text::{Font, FontBook};
+use typst::utils::LazyHash;
+use typst::{compile, Library, LibraryExt, World};
+use typst_pdf::{pdf, PdfOptions};
 
 /// PDF 文件信息
 #[derive(Debug, Clone)]
@@ -8,320 +16,279 @@ pub struct PdfOutput {
     pub path: String,
 }
 
-/// 生成巩固练习 PDF
+/// 生成巩固练习 PDF（通过 Typst）
 pub fn generate_pdf(practice: &PracticeSet, pdf_path: &str) -> anyhow::Result<PdfOutput> {
     let questions: Vec<PracticeQuestion> =
         serde_json::from_str(&practice.questions).unwrap_or_default();
 
-    // 读取字体文件
-    let font_bytes = read_font_bytes()?;
+    // 加载字体
+    let (fonts, font_family) = load_fonts()?;
 
-    let mut doc = PdfDocument::new(&format!("巩固练习 - {}", practice.subject));
+    // 构建 Typst 标记源码
+    let markup = build_typst_markup(&questions, &practice.subject, &font_family);
 
-    // 解析并注册字体
-    let parsed_font = ParsedFont::from_bytes(&font_bytes, 0, &mut vec![])
-        .ok_or_else(|| anyhow::anyhow!("字体解析失败"))?;
-    let font_id = doc.add_font(&parsed_font);
+    // 创建 Typst World
+    let mut world = TypstWorld::new(markup, fonts)?;
 
-    // 页面尺寸 (A4)
-    let page_w = Mm(210.0);
-    let page_h = Mm(297.0);
+    // 编译
+    let warned = compile(&mut world);
+    let document = warned
+        .output
+        .map_err(|errors| anyhow::anyhow!("Typst 编译失败: {:?}", errors))?;
 
-    // 内容区域边距 (mm)
-    let margin_left = 20.0;
-    let margin_top = 20.0;
-    let margin_right = 20.0;
-    let content_width_mm = 210.0 - margin_left - margin_right;
-
-    let font_size_title: Pt = Pt(18.0);
-    let font_size_heading: Pt = Pt(14.0);
-    let font_size_body: Pt = Pt(11.0);
-    let line_height: Pt = Pt(20.0);
-
-    let mut question_lines: Vec<(Pt, String)> = Vec::new();
-    let mut answer_lines: Vec<(Pt, String)> = Vec::new();
-    let subject = sanitize_pdf_text(&practice.subject);
-
-    question_lines.push((font_size_title, format!("巩固练习 - {}", subject)));
-    question_lines.push((Pt(8.0), String::new()));
-
-    answer_lines.push((font_size_title, format!("参考答案与知识点 - {}", subject)));
-    answer_lines.push((Pt(8.0), String::new()));
-
-    for (i, q) in questions.iter().enumerate() {
-        question_lines.push((font_size_heading, format!("第 {} 题", i + 1)));
-        question_lines.push((Pt(4.0), String::new()));
-
-        // 题目文本（按换行拆分）
-        let sanitized_question = sanitize_pdf_text(&q.question);
-        for line in sanitized_question.lines() {
-            for wrapped in wrap_line(line, content_width_mm, font_size_body.0) {
-                question_lines.push((font_size_body, wrapped));
-            }
-        }
-        question_lines.push((Pt(10.0), String::new()));
-
-        answer_lines.push((font_size_heading, format!("第 {} 题", i + 1)));
-        answer_lines.push((Pt(4.0), String::new()));
-
-        let sanitized_answer = sanitize_pdf_text(&q.answer);
-        for wrapped in wrap_line(
-            &format!("答案: {}", sanitized_answer),
-            content_width_mm,
-            font_size_body.0,
-        ) {
-            answer_lines.push((font_size_body, wrapped));
-        }
-        answer_lines.push((Pt(2.0), String::new()));
-
-        let kp = sanitize_pdf_text(&q.knowledge_points.join("、"));
-        for wrapped in wrap_line(
-            &format!("知识点: {}", kp),
-            content_width_mm,
-            font_size_body.0,
-        ) {
-            answer_lines.push((font_size_body, wrapped));
-        }
-        answer_lines.push((Pt(10.0), String::new()));
+    for warning in &warned.warnings {
+        tracing::warn!("Typst warning: {:?}", warning);
     }
 
-    let mut pages: Vec<PdfPage> = Vec::new();
-    pages.extend(paginate_lines(
-        &question_lines,
-        page_w,
-        page_h,
-        margin_left,
-        margin_top,
-        line_height,
-        &font_id,
-    ));
+    // 导出 PDF
+    let pdf_bytes = pdf(&document, &PdfOptions::default())
+        .map_err(|e| anyhow::anyhow!("PDF 导出失败: {:?}", e))?;
 
-    if !questions.is_empty() {
-        pages.extend(paginate_lines(
-            &answer_lines,
-            page_w,
-            page_h,
-            margin_left,
-            margin_top,
-            line_height,
-            &font_id,
-        ));
-    }
-
-    // 无内容时至少放一页标题
-    if pages.is_empty() {
-        pages.push(build_page(
-            &[(font_size_title, format!("巩固练习 - {}", subject))].to_vec(),
-            page_w,
-            page_h,
-            margin_left,
-            margin_top,
-            line_height,
-            &font_id,
-        ));
-    }
-
-    doc.with_pages(pages);
-
-    let mut warnings = vec![];
-    let bytes = doc.save(
-        &PdfSaveOptions {
-            subset_fonts: true,
-            optimize: true,
-            ..Default::default()
-        },
-        &mut warnings,
-    );
-
-    for w in &warnings {
-        if w.severity != printpdf::PdfParseErrorSeverity::Info {
-            tracing::warn!("PDF warning: {:?}", w);
-        }
-    }
-
-    std::fs::write(pdf_path, &bytes)
+    // 写入文件
+    std::fs::write(pdf_path, &pdf_bytes)
         .map_err(|e| anyhow::anyhow!("写入 PDF 失败 {}: {}", pdf_path, e))?;
 
-    tracing::info!(path = pdf_path, "PDF 已生成");
+    tracing::info!(path = pdf_path, "PDF 已生成 (Typst)");
     Ok(PdfOutput {
         path: pdf_path.to_string(),
     })
 }
 
-fn paginate_lines(
-    all_lines: &[(Pt, String)],
-    page_w: Mm,
-    page_h: Mm,
-    margin_left: f32,
-    margin_top: f32,
-    line_height: Pt,
-    font_id: &FontId,
-) -> Vec<PdfPage> {
-    let page_content_height_mm = 297.0 - margin_top - 20.0;
-    let mm_per_pt = 25.4 / 72.0;
+// ============================================================
+// Typst World 实现
+// ============================================================
 
-    let mut pages: Vec<PdfPage> = Vec::new();
-    let mut current_lines: Vec<(Pt, String)> = Vec::new();
-    let mut current_height_mm: f32 = 0.0;
-
-    for (size, text) in all_lines.iter().cloned() {
-        let line_mm = if text.is_empty() {
-            size.0 * mm_per_pt
-        } else {
-            line_height.0 * mm_per_pt
-        };
-
-        if current_height_mm + line_mm > page_content_height_mm && !current_lines.is_empty() {
-            pages.push(build_page(
-                &current_lines,
-                page_w,
-                page_h,
-                margin_left,
-                margin_top,
-                line_height,
-                font_id,
-            ));
-            current_lines.clear();
-            current_height_mm = 0.0;
-        }
-
-        current_height_mm += line_mm;
-        current_lines.push((size, text));
-    }
-
-    if !current_lines.is_empty() {
-        pages.push(build_page(
-            &current_lines,
-            page_w,
-            page_h,
-            margin_left,
-            margin_top,
-            line_height,
-            font_id,
-        ));
-    }
-
-    pages
+/// 最小化的 Typst World 实现，用于编译单文件
+struct TypstWorld {
+    library: LazyHash<Library>,
+    book: LazyHash<FontBook>,
+    fonts: Vec<Font>,
+    source: Source,
+    main_id: FileId,
 }
 
-/// 构建单个 PDF 页面
-fn build_page(
-    lines: &[(Pt, String)],
-    page_w: Mm,
-    page_h: Mm,
-    margin_left: f32,
-    margin_top: f32,
-    default_line_height: Pt,
-    font_id: &FontId,
-) -> PdfPage {
-    let mut ops = vec![
-        Op::StartTextSection,
-        Op::SetTextCursor {
-            pos: Point {
-                x: Mm(margin_left).into(),
-                y: Mm(297.0 - margin_top).into(),
-            },
-        },
-    ];
-
-    let mut first_line = true;
-
-    for (font_size, text) in lines {
-        let line_height = if text.is_empty() {
-            *font_size
-        } else {
-            default_line_height
+impl TypstWorld {
+    fn new(markup: String, fonts: Vec<Font>) -> anyhow::Result<Self> {
+        let library = Library::builder().build();
+        let book = {
+            let mut b = FontBook::default();
+            for font in &fonts {
+                b.push(font.info().clone());
+            }
+            b
         };
+        let main_id = FileId::new_fake(VirtualPath::new("/main.typ"));
+        let source = Source::new(main_id, markup);
 
-        if !first_line {
-            ops.push(Op::SetLineHeight { lh: line_height });
-            ops.push(Op::AddLineBreak);
-        }
-        first_line = false;
-
-        if text.is_empty() {
-            continue;
-        }
-
-        ops.push(Op::SetFont {
-            font: PdfFontHandle::External(font_id.clone()),
-            size: *font_size,
-        });
-        ops.push(Op::ShowText {
-            items: vec![TextItem::Text(text.clone())],
-        });
+        Ok(Self {
+            library: LazyHash::new(library),
+            book: LazyHash::new(book),
+            fonts,
+            source,
+            main_id,
+        })
     }
-
-    ops.push(Op::EndTextSection);
-    PdfPage::new(page_w, page_h, ops)
 }
 
-/// 读取字体文件
-fn read_font_bytes() -> anyhow::Result<Vec<u8>> {
-    // 优先 Alibaba PuHuiTi，备选 NotoSansSC
+impl World for TypstWorld {
+    fn library(&self) -> &LazyHash<Library> {
+        &self.library
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        &self.book
+    }
+
+    fn main(&self) -> FileId {
+        self.main_id
+    }
+
+    fn source(&self, id: FileId) -> Result<Source, FileError> {
+        if id == self.main_id {
+            Ok(self.source.clone())
+        } else {
+            Err(FileError::NotFound(std::path::PathBuf::new()))
+        }
+    }
+
+    fn file(&self, _id: FileId) -> Result<Bytes, FileError> {
+        Err(FileError::NotFound(std::path::PathBuf::new()))
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        self.fonts.get(index).cloned()
+    }
+
+    fn today(&self, _offset: Option<i64>) -> Option<Datetime> {
+        let now = chrono::Local::now();
+        Datetime::from_ymd_hms(
+            now.year(),
+            now.month() as u8,
+            now.day() as u8,
+            now.hour() as u8,
+            now.minute() as u8,
+            now.second() as u8,
+        )
+    }
+}
+
+// ============================================================
+// 字体加载
+// ============================================================
+
+/// 从 fonts/ 目录加载字体文件，返回字体列表和首选字体族名
+fn load_fonts() -> anyhow::Result<(Vec<Font>, String)> {
     let candidates = [
         "fonts/Alibaba-PuHuiTi-Regular.otf",
         "fonts/NotoSansSC-Regular.ttf",
     ];
+
+    let mut fonts = Vec::new();
+
     for path in &candidates {
         if std::path::Path::new(path).exists() {
             let bytes = std::fs::read(path)
                 .map_err(|e| anyhow::anyhow!("读取字体文件失败 {}: {}", path, e))?;
-            if bytes.len() > 100_000 {
-                return Ok(bytes);
+            if bytes.len() < 100_000 {
+                tracing::warn!("字体文件 {} 过小 ({} bytes)，跳过", path, bytes.len());
+                continue;
             }
-            tracing::warn!("字体文件 {} 过小 ({} bytes)，可能无效", path, bytes.len());
+            let data = Bytes::new(bytes);
+            for font in Font::iter(data) {
+                fonts.push(font);
+            }
         }
     }
-    anyhow::bail!("未找到有效的字体文件，请检查 fonts/ 目录")
-}
 
-/// 简单的自动换行：按字符数估算（CJK 字符宽度约为英文 2 倍）
-fn wrap_line(line: &str, content_width_mm: f32, font_size_pt: f32) -> Vec<String> {
-    if line.is_empty() {
-        return vec![String::new()];
+    if fonts.is_empty() {
+        anyhow::bail!("未找到有效的字体文件，请检查 fonts/ 目录");
     }
 
-    // 估算每行能放多少字符
-    // 11pt 字体，大约每字符 3mm (CJK) 或 1.5mm (ASCII)
-    let avg_char_width_mm = 3.0 * (font_size_pt / 11.0);
+    let family = fonts[0].info().family.clone();
+    tracing::debug!(family = %family, count = fonts.len(), "字体已加载");
+    Ok((fonts, family))
+}
 
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut current_width: f32 = 0.0;
+// ============================================================
+// Typst 标记源码生成
+// ============================================================
 
-    for ch in line.chars() {
-        let char_w = if ch.is_ascii() {
-            avg_char_width_mm * 0.5
-        } else {
-            avg_char_width_mm
-        };
-        if current_width + char_w > content_width_mm && !current.is_empty() {
-            result.push(current.clone());
-            current.clear();
-            current_width = 0.0;
+/// 构建 Typst 标记源码：题目在前，答案 + 知识点在新页开始
+fn build_typst_markup(questions: &[PracticeQuestion], subject: &str, font_family: &str) -> String {
+    let subject = escape_typst(&sanitize_text(subject));
+    let font_family = escape_typst(font_family);
+    let generated_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut m = String::with_capacity(4096);
+
+    // ---------- 文档全局设置 ----------
+    m.push_str(
+        "#set page(paper: \"a4\", margin: (left: 20mm, top: 20mm, right: 20mm, bottom: 20mm), footer: context { align(right)[#text(size: 9pt)[第 #counter(page).display(\"1\") 页 / 共 #counter(page).final().at(0) 页]] })\n",
+    );
+    m.push_str(&format!(
+        "#set text(font: \"{}\", size: 11pt)\n",
+        font_family
+    ));
+    m.push_str("#set par(leading: 1em, justify: false)\n\n");
+
+    // ---------- 题目部分 ----------
+    m.push_str("#align(center)[\n");
+    m.push_str(&format!(
+        "  #text(size: 18pt, weight: \"bold\")[巩固练习 - {}]\n",
+        subject
+    ));
+    m.push_str("]\n\n");
+    m.push_str(&format!(
+        "#align(center)[#text(size: 10pt, fill: luma(120))[生成时间：{}]]\n\n",
+        generated_date
+    ));
+    m.push_str("#v(8pt)\n\n");
+
+    for (i, q) in questions.iter().enumerate() {
+        m.push_str(&format!(
+            "#text(size: 14pt, weight: \"bold\")[第 {} 题]\n",
+            i + 1
+        ));
+        m.push_str("#v(4pt)\n\n");
+
+        let question_text = escape_typst(&sanitize_text(&q.question));
+        for line in question_text.lines() {
+            m.push_str(line);
+            m.push('\n');
         }
-        current.push(ch);
-        current_width += char_w;
+        m.push_str("\n#v(10pt)\n\n");
     }
 
-    if !current.is_empty() {
-        result.push(current);
+    // ---------- 无内容时至少输出标题 ----------
+    if questions.is_empty() {
+        return m;
     }
 
-    if result.is_empty() {
-        result.push(line.to_string());
+    // ---------- 答案部分（新页开始） ----------
+    m.push_str("#pagebreak()\n\n");
+
+    m.push_str("#align(center)[\n");
+    m.push_str(&format!(
+        "  #text(size: 18pt, weight: \"bold\")[参考答案与知识点 - {}]\n",
+        subject
+    ));
+    m.push_str("]\n\n");
+    m.push_str(&format!(
+        "#align(center)[#text(size: 10pt, fill: luma(120))[生成时间：{}]]\n\n",
+        generated_date
+    ));
+    m.push_str("#v(8pt)\n\n");
+
+    for (i, q) in questions.iter().enumerate() {
+        m.push_str(&format!(
+            "#text(size: 14pt, weight: \"bold\")[第 {} 题]\n",
+            i + 1
+        ));
+        m.push_str("#v(4pt)\n\n");
+
+        let answer = escape_typst(&sanitize_text(&q.answer));
+        m.push_str(&format!("答案: {}\n", answer));
+
+        let kp = escape_typst(&sanitize_text(&q.knowledge_points.join("、")));
+        m.push_str(&format!("知识点: {}\n", kp));
+
+        m.push_str("\n#v(10pt)\n\n");
     }
 
-    result
+    m
 }
 
-fn sanitize_pdf_text(s: &str) -> String {
+// ============================================================
+// 文本清洗与转义
+// ============================================================
+
+/// 过滤 emoji 类字符并去除首尾空白
+fn sanitize_text(s: &str) -> String {
     s.chars()
         .filter(|&ch| !is_emoji_like(ch))
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+/// 转义 Typst 标记中的特殊字符
+fn escape_typst(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + s.len() / 4);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '#' => out.push_str("\\#"),
+            '$' => out.push_str("\\$"),
+            '[' => out.push_str("\\["),
+            ']' => out.push_str("\\]"),
+            '*' => out.push_str("\\*"),
+            '_' => out.push_str("\\_"),
+            '@' => out.push_str("\\@"),
+            '~' => out.push_str("\\~"),
+            '`' => out.push_str("\\`"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn is_emoji_like(ch: char) -> bool {
@@ -331,10 +298,15 @@ fn is_emoji_like(ch: char) -> bool {
         0x200D
             | 0x20E3
             | 0xFE0F
+            | 0x2600..=0x27BF
             | 0x1F1E6..=0x1F1FF
             | 0x1F300..=0x1FAFF
     )
 }
+
+// ============================================================
+// 测试
+// ============================================================
 
 #[cfg(test)]
 mod tests {
@@ -390,27 +362,53 @@ mod tests {
             text.contains("参考答案与知识点"),
             "Should contain answer section title"
         );
-        assert!(text.contains("第1题"), "Should contain question heading");
+        assert!(text.contains("生成时间："), "Should contain generated date");
         assert!(
-            !text.contains('😀'),
+            text.contains("第1题") || text.contains("第 1 题"),
+            "Should contain question heading"
+        );
+        assert!(
+            text.contains("第 1 页 / 共 2 页")
+                || text.contains("第1页/共2页")
+                || text.contains("第 1 页/共 2 页")
+                || text.contains("第1页 / 共2页"),
+            "Should contain page number format"
+        );
+        assert!(
+            !text.contains('\u{1F600}'),
             "Should not contain emoji from question"
         );
         assert!(
-            !text.contains('✅'),
+            !text.contains('\u{2705}'),
             "Should not contain emoji from answer label/content"
         );
 
-        println!("✅ PDF test passed - {} bytes", pdf_bytes.len());
+        println!("PDF test passed - {} bytes", pdf_bytes.len());
     }
 
     #[test]
-    fn test_read_font_bytes() {
-        let bytes = read_font_bytes().expect("should find a font");
-        assert!(
-            bytes.len() > 100_000,
-            "Font should be large enough, got {} bytes",
-            bytes.len()
-        );
-        println!("Font file: {} bytes", bytes.len());
+    fn test_load_fonts() {
+        let (fonts, family) = load_fonts().expect("should find fonts");
+        assert!(!fonts.is_empty(), "Should load at least one font");
+        assert!(!family.is_empty(), "Font family name should not be empty");
+        println!("Font family: {}, count: {}", family, fonts.len());
+    }
+
+    #[test]
+    fn test_escape_typst() {
+        assert_eq!(escape_typst("hello"), "hello");
+        assert_eq!(escape_typst("a#b"), "a\\#b");
+        assert_eq!(escape_typst("a\\b"), "a\\\\b");
+        assert_eq!(escape_typst("$x$"), "\\$x\\$");
+        assert_eq!(escape_typst("*bold*"), "\\*bold\\*");
+    }
+
+    #[test]
+    fn test_sanitize_text() {
+        // 😀 U+1F600 is in the filtered range 0x1F300..=0x1FAFF
+        assert_eq!(sanitize_text("😀 hello"), "hello");
+        // ✅ U+2705 is in the filtered range; it should be removed.
+        assert_eq!(sanitize_text("✅ done"), "done");
+        assert_eq!(sanitize_text("  clean  "), "clean");
     }
 }

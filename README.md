@@ -21,7 +21,7 @@
 - **大模型**: OpenAI 兼容 API（支持自定义 base_url / key）
 - **Embedding**: 多模态 embedding（文本 + 图片）
 - **数据库**: libsql（支持向量存储）
-- **PDF**: printpdf
+- **PDF**: Typst (typst + typst-pdf)
 - **MCP**: rmcp（stdio 传输）
 
 ## 构建
@@ -459,7 +459,7 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 │  │  │                 数据持久化层                        │  │  │
 │  │  │   ┌──────────┐  ┌──────────┐  ┌──────────────┐   │  │  │
 │  │  │   │  libsql   │  │  文件存储  │  │   PDF 输出    │   │  │  │
-│  │  │   │ (向量 DB) │  │  (图片)   │  │ (printpdf)  │   │  │  │
+│  │  │   │ (向量 DB) │  │  (图片)   │  │  (Typst)     │   │  │  │
 │  │  │   └──────────┘  └──────────┘  └──────────────┘   │  │  │
 │  │  └───────────────────────────────────────────────────┘  │  │
 │  └─────────────────────────────────────────────────────────┘  │
@@ -472,7 +472,7 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 src/
 ├── main.rs                  # 入口：CLI 子命令分发
 ├── config.rs                # 配置加载与环境变量覆盖
-├── pdf.rs                   # PDF 渲染输出 (printpdf)
+├── pdf.rs                   # PDF 渲染输出 (Typst)
 ├── analysis/
 │   ├── analyzer.rs          # 错题分析编排（图片→LLM→解析→embedding→入库）
 │   └── parser.rs            # LLM 响应解析（markdown + JSON 容错提取）
@@ -598,7 +598,7 @@ ClassificationTag (分类标签子表)
    构建出题 Prompt → 调用 LLM 生成题目
         │
         ├──→ 存入 practice_sets 表
-        └──→ 渲染 PDF（printpdf + 中文字体）
+        └──→ 渲染 PDF（Typst + 中文字体）
 ```
 
 ### 关键设计决策
