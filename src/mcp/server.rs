@@ -37,6 +37,30 @@ fn json_err(message: impl Into<String>) -> String {
     .to_string()
 }
 
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") || trimmed.eq_ignore_ascii_case("none") {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_optional_date(value: Option<String>, end_of_day: bool) -> Option<chrono::NaiveDateTime> {
+    normalize_optional_string(value)
+        .as_deref()
+        .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        .and_then(|d| {
+            if end_of_day {
+                d.and_hms_opt(23, 59, 59)
+            } else {
+                d.and_hms_opt(0, 0, 0)
+            }
+        })
+}
+
 /// MCP Server handler
 pub struct McpHandler {
     config: Arc<AppConfig>,
@@ -443,9 +467,10 @@ impl McpHandler {
     #[tool(description = "列出后台任务：按 kind 筛选，便于恢复长任务")]
     async fn list_jobs(&self, params: Parameters<ListJobsParams>) -> String {
         let params = params.0;
+        let kind = normalize_optional_string(params.kind);
         match self
             .repository()
-            .list_mcp_jobs(params.kind.as_deref(), Some(params.limit.unwrap_or(20)))
+            .list_mcp_jobs(kind.as_deref(), Some(params.limit.unwrap_or(20)))
             .await
         {
             Ok(jobs) => json_ok(serde_json::json!({
@@ -530,22 +555,12 @@ impl McpHandler {
         let params = params.0;
         let repo = self.repository();
         let limit = params.limit.unwrap_or(20);
+        let subject = normalize_optional_string(params.subject);
 
-        let from_dt = params.from.as_deref()
-            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
-            .transpose()
-            .ok()
-            .flatten()
-            .and_then(|d| d.and_hms_opt(0, 0, 0));
+        let from_dt = parse_optional_date(params.from, false);
+        let to_dt = parse_optional_date(params.to, true);
 
-        let to_dt = params.to.as_deref()
-            .map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
-            .transpose()
-            .ok()
-            .flatten()
-            .and_then(|d| d.and_hms_opt(23, 59, 59));
-
-        match repo.list_error_records(params.subject.as_deref(), from_dt, to_dt, Some(limit)).await {
+        match repo.list_error_records(subject.as_deref(), from_dt, to_dt, Some(limit)).await {
             Ok(records) => {
                 if records.is_empty() {
                     json_ok(serde_json::json!({"items": []}))
@@ -574,8 +589,9 @@ impl McpHandler {
         let params = params.0;
         let repo = self.repository();
         let limit = params.limit.unwrap_or(20);
+        let subject = normalize_optional_string(params.subject);
 
-        match repo.list_summaries(params.subject.as_deref(), Some(limit)).await {
+        match repo.list_summaries(subject.as_deref(), Some(limit)).await {
             Ok(summaries) => {
                 if summaries.is_empty() {
                     json_ok(serde_json::json!({"items": []}))
@@ -610,9 +626,11 @@ impl McpHandler {
         let params = params.0;
         let repo = self.repository();
         let limit = params.limit.unwrap_or(20);
+        let subject = normalize_optional_string(params.subject);
+        let summary_id = normalize_optional_string(params.summary_id);
 
         match repo
-            .list_practice_sets(params.subject.as_deref(), params.summary_id.as_deref(), Some(limit))
+            .list_practice_sets(subject.as_deref(), summary_id.as_deref(), Some(limit))
             .await
         {
             Ok(practices) => {
@@ -646,6 +664,7 @@ impl McpHandler {
     async fn search_errors(&self, params: Parameters<SearchParams>) -> String {
         let params = params.0;
         let limit = params.limit.unwrap_or(10);
+        let subject = normalize_optional_string(params.subject);
 
         let text_emb = match self.embedding_client.embed(&params.query).await {
             Ok(emb) => emb,
@@ -653,7 +672,7 @@ impl McpHandler {
         };
 
         let repo = self.repository();
-        match repo.search_by_text_vector(&text_emb, limit, params.subject.as_deref()).await {
+        match repo.search_by_text_vector(&text_emb, limit, subject.as_deref()).await {
             Ok(results) => {
                 if results.is_empty() {
                     json_ok(serde_json::json!({"items": []}))

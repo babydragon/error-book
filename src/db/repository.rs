@@ -128,9 +128,11 @@ impl Repository {
             where_clause, limit_clause
         );
 
-        let mut rows = conn
-            .query(&sql, libsql::params_from_iter(param_values))
-            .await?;
+        let mut rows = if param_values.is_empty() {
+            conn.query(&sql, ()).await?
+        } else {
+            conn.query(&sql, libsql::params_from_iter(param_values)).await?
+        };
 
         let mut records = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -342,9 +344,11 @@ impl Repository {
             ),
         };
 
-        let mut rows = conn
-            .query(&sql, libsql::params_from_iter(param_values))
-            .await?;
+        let mut rows = if param_values.is_empty() {
+            conn.query(&sql, ()).await?
+        } else {
+            conn.query(&sql, libsql::params_from_iter(param_values)).await?
+        };
 
         let mut summaries = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -426,9 +430,11 @@ impl Repository {
             where_clause, limit_clause
         );
 
-        let mut rows = conn
-            .query(&sql, libsql::params_from_iter(param_values))
-            .await?;
+        let mut rows = if param_values.is_empty() {
+            conn.query(&sql, ()).await?
+        } else {
+            conn.query(&sql, libsql::params_from_iter(param_values)).await?
+        };
 
         let mut practices = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -527,7 +533,11 @@ impl Repository {
             ),
         };
 
-        let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+        let mut rows = if params.is_empty() {
+            conn.query(&sql, ()).await?
+        } else {
+            conn.query(&sql, libsql::params_from_iter(params)).await?
+        };
         let mut jobs = Vec::new();
         while let Some(row) = rows.next().await? {
             jobs.push(row_to_mcp_job(&row)?);
