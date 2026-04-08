@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
 use clap::Parser;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use error_book::cli::commands::{Cli, Command};
 use error_book::config::AppConfig;
@@ -40,20 +42,43 @@ async fn open_database(config: &AppConfig) -> Result<libsql::Database> {
     Ok(db)
 }
 
+fn init_logging(config: &AppConfig) -> Result<()> {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(config.logging.level.clone()));
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(io::stderr)
+        .with_ansi(true);
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer);
+
+    if let Some(path) = &config.logging.file {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("打开日志文件失败: {}", path.display()))?;
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file)
+            .with_ansi(false);
+        registry.with(file_layer).init();
+    } else {
+        registry.init();
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
 
     // 加载配置
     let config = AppConfig::load(&cli.config)?;
     config.ensure_dirs()?;
+    init_logging(&config)?;
 
     // 初始化数据库
     let db = Arc::new(open_database(&config).await?);

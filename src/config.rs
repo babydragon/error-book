@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub pdf: PdfConfig,
     #[serde(default)]
     pub search: SearchConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 /// Chat LLM provider configuration (independent from embedding)
@@ -164,6 +166,23 @@ pub struct SearchConfig {
     pub image_weight: f64,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file: None,
+        }
+    }
+}
+
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
@@ -192,6 +211,9 @@ fn default_grade_level() -> String {
 }
 fn default_image_weight() -> f64 {
     0.3
+}
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl AppConfig {
@@ -242,6 +264,12 @@ impl AppConfig {
         if let Ok(v) = std::env::var("ERROR_BOOK_DB_URL") {
             config.database.url = v;
         }
+        if let Ok(v) = std::env::var("ERROR_BOOK_LOG_LEVEL") {
+            config.logging.level = v;
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_LOG_FILE") {
+            config.logging.file = Some(PathBuf::from(v));
+        }
 
         config.resolve_paths(path)?;
         config.validate()?;
@@ -269,6 +297,12 @@ impl AppConfig {
             .with_context(|| format!("创建图片目录失败: {}", self.storage.image_dir.display()))?;
         std::fs::create_dir_all(&self.storage.pdf_dir)
             .with_context(|| format!("创建PDF目录失败: {}", self.storage.pdf_dir.display()))?;
+        if let Some(path) = &self.logging.file {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("创建日志目录失败: {}", parent.display()))?;
+            }
+        }
         Ok(())
     }
 
@@ -286,6 +320,11 @@ impl AppConfig {
         }
         if self.pdf.font_path.is_relative() {
             self.pdf.font_path = base_dir.join(&self.pdf.font_path);
+        }
+        if let Some(path) = &self.logging.file {
+            if path.is_relative() {
+                self.logging.file = Some(base_dir.join(path));
+            }
         }
 
         Ok(())

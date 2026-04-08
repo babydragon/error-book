@@ -78,6 +78,12 @@ font_path = "./fonts/NotoSansSC-Regular.ttf"
 [search]
 # 混合搜索时图片 embedding 的权重 (0.0~1.0)，文本权重 = 1.0 - image_weight
 image_weight = 0.3
+
+[logging]
+# 默认日志级别
+level = "info"
+# 可选：日志文件路径。未配置时仅输出到 stderr
+# file = "./data/error-book.log"
 ```
 
 ### 环境变量覆盖
@@ -103,6 +109,7 @@ image_weight = 0.3
 - embedding: 当前仅 `provider = "google"` 已实现；`openai` 预留但暂未实现
 - 当 `provider = "google"` 时，`base_url` 应填写 Google 原生接口根地址，而不是 `/openai/` 兼容地址
 - `pdf.font_path` 为必填项；程序启动时会校验字体文件存在且可解析，不再使用默认回退字体
+- 日志默认写入 stderr；可通过 `logging.level` 配置日志级别，并通过 `logging.file` 追加写入日志文件
 
 Chat 配置示例：
 
@@ -355,9 +362,12 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 | `list_errors` | 列出错题记录 |
 | `list_summaries` | 列出已生成的总结记录 |
 | `list_practices` | 列出已生成的练习题记录 |
+| `list_jobs` | 列出后台任务 |
+| `get_job_status` | 查询后台任务状态 |
+| `get_job_result` | 获取后台任务结果 |
 | `search_errors` | 语义搜索错题 |
-| `generate_summary` | 生成阶段性总结 |
-| `generate_practice` | 生成巩固练习题（支持额外要求） |
+| `generate_summary` | 提交阶段性总结任务 |
+| `generate_practice` | 提交巩固练习题任务（支持额外要求） |
 | `generate_practice_pdf` | 按已有练习集 ID 导出 PDF |
 
 说明：以上 MCP 工具现在统一返回 **JSON 字符串**，顶层结构为：
@@ -390,8 +400,8 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
    - `show_error`
 
 2. **阶段性总结 / 生成练习 / 导出 PDF**
-   - `generate_summary` -> `show_summary`
-   - `generate_practice` -> `show_practice`
+   - `generate_summary` -> `get_job_status` / `get_job_result` -> `show_summary`
+   - `generate_practice` -> `get_job_status` / `get_job_result` -> `show_practice`
    - `generate_practice_pdf`
 
 这样可以避免在刚录入少量错题、样本不足时，客户端过早进入“总结并生成练习”的流程。

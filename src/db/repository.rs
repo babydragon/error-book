@@ -4,9 +4,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::NaiveDateTime;
 
-use super::models::{ErrorRecord, ErrorRecordWithScore, PracticeSet, Summary};
+use super::models::{ErrorRecord, ErrorRecordWithScore, McpJob, PracticeSet, Summary};
 
 /// 数据访问层
+#[derive(Clone)]
 pub struct Repository {
     db: Arc<libsql::Database>,
 }
@@ -469,6 +470,122 @@ impl Repository {
         tracing::info!(id = %practice.id, "练习集已保存");
         Ok(())
     }
+
+    // ===== MCP 后台任务 =====
+
+    pub async fn insert_mcp_job(&self, job: &McpJob) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO mcp_jobs (id, kind, status, input_json, result_json, error_message, progress_message, created_at, updated_at, started_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(job.id.clone()),
+                libsql::Value::from(job.kind.clone()),
+                libsql::Value::from(job.status.clone()),
+                libsql::Value::from(job.input_json.clone()),
+                job.result_json.clone().map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+                job.error_message.clone().map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+                job.progress_message.clone().map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+                libsql::Value::from(job.created_at),
+                libsql::Value::from(job.updated_at),
+                job.started_at.map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+                job.completed_at.map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+            ]),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn get_mcp_job(&self, id: &str) -> Result<Option<McpJob>> {
+        let conn = self.conn()?;
+        let mut rows = conn
+            .query(
+                "SELECT id, kind, status, input_json, result_json, error_message, progress_message, created_at, updated_at, started_at, completed_at FROM mcp_jobs WHERE id = ?1",
+                [id],
+            )
+            .await?;
+
+        match rows.next().await? {
+            Some(row) => Ok(Some(row_to_mcp_job(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_mcp_jobs(&self, kind: Option<&str>, limit: Option<u32>) -> Result<Vec<McpJob>> {
+        let conn = self.conn()?;
+        let limit_clause = match limit {
+            Some(l) => format!(" LIMIT {}", l),
+            None => String::new(),
+        };
+
+        let (sql, params): (String, Vec<libsql::Value>) = match kind {
+            Some(kind) => (
+                format!("SELECT id, kind, status, input_json, result_json, error_message, progress_message, created_at, updated_at, started_at, completed_at FROM mcp_jobs WHERE kind = ?1 ORDER BY created_at DESC{}", limit_clause),
+                vec![libsql::Value::from(kind.to_string())],
+            ),
+            None => (
+                format!("SELECT id, kind, status, input_json, result_json, error_message, progress_message, created_at, updated_at, started_at, completed_at FROM mcp_jobs ORDER BY created_at DESC{}", limit_clause),
+                Vec::new(),
+            ),
+        };
+
+        let mut rows = conn.query(&sql, libsql::params_from_iter(params)).await?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            jobs.push(row_to_mcp_job(&row)?);
+        }
+        Ok(jobs)
+    }
+
+    pub async fn mark_mcp_job_running(&self, id: &str, progress: Option<&str>, started_at: i64) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE mcp_jobs SET status = 'running', progress_message = ?1, started_at = ?2, updated_at = ?2 WHERE id = ?3",
+            libsql::params_from_iter(vec![
+                progress.map(libsql::Value::from).unwrap_or(libsql::Value::Null),
+                libsql::Value::from(started_at),
+                libsql::Value::from(id.to_string()),
+            ]),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn update_mcp_job_progress(&self, id: &str, progress: &str, updated_at: i64) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE mcp_jobs SET progress_message = ?1, updated_at = ?2 WHERE id = ?3",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(progress.to_string()),
+                libsql::Value::from(updated_at),
+                libsql::Value::from(id.to_string()),
+            ]),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn complete_mcp_job(&self, id: &str, result_json: &str, completed_at: i64) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE mcp_jobs SET status = 'succeeded', result_json = ?1, error_message = NULL, progress_message = NULL, updated_at = ?2, completed_at = ?2 WHERE id = ?3",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(result_json.to_string()),
+                libsql::Value::from(completed_at),
+                libsql::Value::from(id.to_string()),
+            ]),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn fail_mcp_job(&self, id: &str, error_message: &str, completed_at: i64) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "UPDATE mcp_jobs SET status = 'failed', error_message = ?1, progress_message = NULL, updated_at = ?2, completed_at = ?2 WHERE id = ?3",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(error_message.to_string()),
+                libsql::Value::from(completed_at),
+                libsql::Value::from(id.to_string()),
+            ]),
+        ).await?;
+        Ok(())
+    }
 }
 
 /// 从 Row 构造 ErrorRecord（不含 embedding，避免大量数据传输）
@@ -516,5 +633,21 @@ fn row_to_practice_set(row: &libsql::Row) -> Result<PracticeSet> {
         questions: row.get::<String>(4)?,
         pdf_path: row.get::<Option<String>>(5)?,
         created_at: row.get::<i64>(6)?,
+    })
+}
+
+fn row_to_mcp_job(row: &libsql::Row) -> Result<McpJob> {
+    Ok(McpJob {
+        id: row.get::<String>(0)?,
+        kind: row.get::<String>(1)?,
+        status: row.get::<String>(2)?,
+        input_json: row.get::<String>(3)?,
+        result_json: row.get::<Option<String>>(4)?,
+        error_message: row.get::<Option<String>>(5)?,
+        progress_message: row.get::<Option<String>>(6)?,
+        created_at: row.get::<i64>(7)?,
+        updated_at: row.get::<i64>(8)?,
+        started_at: row.get::<Option<i64>>(9)?,
+        completed_at: row.get::<Option<i64>>(10)?,
     })
 }

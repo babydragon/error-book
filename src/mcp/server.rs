@@ -9,6 +9,7 @@ use rmcp::{
     transport::io::stdio,
 };
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::analysis::analyzer::Analyzer;
 use crate::analysis::parser::PracticeQuestion;
@@ -47,6 +48,10 @@ pub struct McpHandler {
     tool_router: ToolRouter<Self>,
 }
 
+const JOB_KIND_ANALYZE_ERROR: &str = "analyze_error";
+const JOB_KIND_GENERATE_SUMMARY: &str = "generate_summary";
+const JOB_KIND_GENERATE_PRACTICE: &str = "generate_practice";
+
 impl McpHandler {
     pub fn new(
         config: AppConfig,
@@ -68,6 +73,136 @@ impl McpHandler {
 
     fn repository(&self) -> Repository {
         Repository::new(Arc::clone(&self.db))
+    }
+
+    fn spawn_analyze_job(&self, job_id: String, request: AnalysisRequest) {
+        let config = (*self.config).clone();
+        let chat_client = (*self.chat_client).clone();
+        let embedding_client = (*self.embedding_client).clone();
+        let image_storage = (*self.image_storage).clone();
+        let repository = self.repository();
+        let concurrency = Arc::clone(&self.concurrency);
+
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let _ = repository.mark_mcp_job_running(&job_id, Some("正在分析错题图片"), now).await;
+            let _guard = concurrency.lock().await;
+            let analyzer = Analyzer::new(config, chat_client, embedding_client, image_storage, repository.clone());
+
+            match analyzer.analyze(request).await {
+                Ok(record) => {
+                    let result = serde_json::json!({
+                        "type": "error_record",
+                        "id": record.id,
+                        "subject": record.subject,
+                        "grade_level": record.grade_level,
+                        "classification": serde_json::from_str::<Vec<String>>(&record.classification).unwrap_or_default(),
+                        "original_question": record.original_question,
+                        "error_reason": record.error_reason,
+                        "suggestions": record.suggestions,
+                        "created_at": record.created_at,
+                    });
+                    let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+                Err(e) => {
+                    let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
+
+    fn spawn_summary_job(&self, job_id: String, subject: String, from: chrono::NaiveDate, to: chrono::NaiveDate, period_type: String) {
+        let config = (*self.config).clone();
+        let chat_client = (*self.chat_client).clone();
+        let repository = self.repository();
+        let concurrency = Arc::clone(&self.concurrency);
+
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let _ = repository.mark_mcp_job_running(&job_id, Some("正在生成阶段性总结"), now).await;
+            let _guard = concurrency.lock().await;
+            let generator = SummaryGenerator::new(config, chat_client, repository.clone());
+
+            match generator
+                .generate(
+                    &subject,
+                    from.and_hms_opt(0, 0, 0).unwrap(),
+                    to.and_hms_opt(23, 59, 59).unwrap(),
+                    &period_type,
+                )
+                .await
+            {
+                Ok(summary) => {
+                    let result = serde_json::json!({
+                        "type": "summary",
+                        "id": summary.id,
+                        "subject": summary.subject,
+                        "period_type": summary.period_type,
+                        "period_start_text": from.format("%Y-%m-%d").to_string(),
+                        "period_end_text": to.format("%Y-%m-%d").to_string(),
+                        "common_reasons": summary.common_reasons,
+                        "common_suggestions": summary.common_suggestions,
+                        "weak_points": serde_json::from_str::<Vec<String>>(&summary.weak_points).unwrap_or_default(),
+                        "detail": summary.detail,
+                        "created_at": summary.created_at,
+                    });
+                    let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+                Err(e) => {
+                    let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
+
+    fn spawn_practice_job(&self, job_id: String, summary_id: String, count: u32, requirements: Option<String>, output_path: Option<String>) {
+        let config = (*self.config).clone();
+        let pdf_config = config.pdf.clone();
+        let chat_client = (*self.chat_client).clone();
+        let repository = self.repository();
+        let concurrency = Arc::clone(&self.concurrency);
+
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let _ = repository.mark_mcp_job_running(&job_id, Some("正在生成巩固练习题"), now).await;
+            let _guard = concurrency.lock().await;
+            let generator = PracticeGenerator::new(config, chat_client, repository.clone());
+
+            match generator.generate(&summary_id, count, requirements.as_deref(), None).await {
+                Ok(practice) => {
+                    let questions: Vec<PracticeQuestion> = serde_json::from_str(&practice.questions).unwrap_or_default();
+                    let mut pdf_path = practice.pdf_path.clone();
+                    if let Some(path) = output_path {
+                        match crate::pdf::generate_pdf(&practice, &pdf_config, &path) {
+                            Ok(pdf_out) => {
+                                pdf_path = Some(pdf_out.path.clone());
+                                let _ = repository.update_practice_set_pdf_path(&practice.id, &pdf_out.path).await;
+                            }
+                            Err(e) => {
+                                let _ = repository.fail_mcp_job(&job_id, &format!("PDF 生成失败: {}", e), chrono::Utc::now().timestamp()).await;
+                                return;
+                            }
+                        }
+                    }
+
+                    let result = serde_json::json!({
+                        "type": "practice",
+                        "id": practice.id,
+                        "summary_id": practice.summary_id,
+                        "subject": practice.subject,
+                        "requirements": practice.requirements,
+                        "questions": questions,
+                        "question_count": questions.len(),
+                        "pdf_path": pdf_path,
+                        "created_at": practice.created_at,
+                    });
+                    let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+                Err(e) => {
+                    let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
     }
 }
 
@@ -177,11 +312,22 @@ pub struct PracticePdfParams {
     pub output_path: String,
 }
 
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct JobStatusParams {
+    pub job_id: String,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct ListJobsParams {
+    pub kind: Option<String>,
+    pub limit: Option<u32>,
+}
+
 // ============ Tool implementations ============
 
 #[tool_router]
 impl McpHandler {
-    #[tool(description = "分析错题图片：识别题目内容、分析错误原因、给出改进建议")]
+    #[tool(description = "提交错题图片分析任务：立即返回 job_id，后续通过 get_job_status / get_job_result 轮询结果")]
     async fn analyze_error(&self, params: Parameters<AnalyzeParams>) -> String {
         let params = params.0;
         let request = AnalysisRequest {
@@ -192,28 +338,34 @@ impl McpHandler {
             color_correction: params.color_correction,
         };
 
-        let _guard = self.concurrency.lock().await;
-        let analyzer = Analyzer::new(
-            (*self.config).clone(),
-            (*self.chat_client).clone(),
-            (*self.embedding_client).clone(),
-            (*self.image_storage).clone(),
-            self.repository(),
-        );
+        let job_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let job = crate::db::models::McpJob {
+            id: job_id.clone(),
+            kind: JOB_KIND_ANALYZE_ERROR.to_string(),
+            status: "queued".to_string(),
+            input_json: serde_json::to_string(&serde_json::json!({
+                "image_path": request.image_path,
+                "subject": request.subject,
+                "grade_level": request.grade_level,
+                "color_teacher": request.color_teacher,
+                "color_correction": request.color_correction,
+            })).unwrap_or_default(),
+            result_json: None,
+            error_message: None,
+            progress_message: Some("等待执行".to_string()),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        };
 
-        match analyzer.analyze(request).await {
-            Ok(record) => json_ok(serde_json::json!({
-                "type": "error_record",
-                "id": record.id,
-                "subject": record.subject,
-                "grade_level": record.grade_level,
-                "classification": serde_json::from_str::<Vec<String>>(&record.classification).unwrap_or_default(),
-                "original_question": record.original_question,
-                "error_reason": record.error_reason,
-                "suggestions": record.suggestions,
-                "created_at": record.created_at,
-            })),
-            Err(e) => json_err(format!("分析失败: {}", e)),
+        match self.repository().insert_mcp_job(&job).await {
+            Ok(_) => {
+                self.spawn_analyze_job(job_id.clone(), request);
+                json_ok(serde_json::json!({"type": "job", "job_id": job_id, "kind": JOB_KIND_ANALYZE_ERROR, "status": "queued"}))
+            }
+            Err(e) => json_err(format!("提交分析任务失败: {}", e)),
         }
     }
 
@@ -238,6 +390,78 @@ impl McpHandler {
             })),
             Ok(None) => json_err(format!("未找到记录: {}", params.id)),
             Err(e) => json_err(format!("查询失败: {}", e)),
+        }
+    }
+
+    #[tool(description = "查询后台任务状态：适用于 analyze_error / generate_summary / generate_practice 等长任务")]
+    async fn get_job_status(&self, params: Parameters<JobStatusParams>) -> String {
+        match self.repository().get_mcp_job(&params.0.job_id).await {
+            Ok(Some(job)) => json_ok(serde_json::json!({
+                "type": "job",
+                "job_id": job.id,
+                "kind": job.kind,
+                "status": job.status,
+                "progress_message": job.progress_message,
+                "error_message": job.error_message,
+                "created_at": job.created_at,
+                "updated_at": job.updated_at,
+                "started_at": job.started_at,
+                "completed_at": job.completed_at,
+            })),
+            Ok(None) => json_err(format!("未找到任务: {}", params.0.job_id)),
+            Err(e) => json_err(format!("查询任务失败: {}", e)),
+        }
+    }
+
+    #[tool(description = "获取后台任务结果：若任务尚未完成，会同时返回当前状态")]
+    async fn get_job_result(&self, params: Parameters<JobStatusParams>) -> String {
+        match self.repository().get_mcp_job(&params.0.job_id).await {
+            Ok(Some(job)) => {
+                let result = job
+                    .result_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+                json_ok(serde_json::json!({
+                    "type": "job_result",
+                    "job_id": job.id,
+                    "kind": job.kind,
+                    "status": job.status,
+                    "progress_message": job.progress_message,
+                    "error_message": job.error_message,
+                    "result": result,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                    "started_at": job.started_at,
+                    "completed_at": job.completed_at,
+                }))
+            }
+            Ok(None) => json_err(format!("未找到任务: {}", params.0.job_id)),
+            Err(e) => json_err(format!("查询任务失败: {}", e)),
+        }
+    }
+
+    #[tool(description = "列出后台任务：按 kind 筛选，便于恢复长任务")]
+    async fn list_jobs(&self, params: Parameters<ListJobsParams>) -> String {
+        let params = params.0;
+        match self
+            .repository()
+            .list_mcp_jobs(params.kind.as_deref(), Some(params.limit.unwrap_or(20)))
+            .await
+        {
+            Ok(jobs) => json_ok(serde_json::json!({
+                "items": jobs.into_iter().map(|job| serde_json::json!({
+                    "job_id": job.id,
+                    "kind": job.kind,
+                    "status": job.status,
+                    "progress_message": job.progress_message,
+                    "error_message": job.error_message,
+                    "created_at": job.created_at,
+                    "updated_at": job.updated_at,
+                    "started_at": job.started_at,
+                    "completed_at": job.completed_at,
+                })).collect::<Vec<_>>()
+            })),
+            Err(e) => json_err(format!("查询任务列表失败: {}", e)),
         }
     }
 
@@ -455,7 +679,7 @@ impl McpHandler {
         }
     }
 
-    #[tool(description = "生成阶段性总结：分析指定时间段内的错题，总结共性错误原因和改进建议")]
+    #[tool(description = "提交阶段性总结任务：立即返回 job_id，后续通过 get_job_status / get_job_result 轮询结果")]
     async fn generate_summary(&self, params: Parameters<SummaryParams>) -> String {
         let params = params.0;
         let from_date = match chrono::NaiveDate::parse_from_str(&params.from, "%Y-%m-%d") {
@@ -468,74 +692,68 @@ impl McpHandler {
         };
         let period_type = params.period_type.unwrap_or_else(|| "week".to_string());
 
-        let _guard = self.concurrency.lock().await;
-        let generator = SummaryGenerator::new(
-            (*self.config).clone(),
-            (*self.chat_client).clone(),
-            self.repository(),
-        );
+        let job_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let job = crate::db::models::McpJob {
+            id: job_id.clone(),
+            kind: JOB_KIND_GENERATE_SUMMARY.to_string(),
+            status: "queued".to_string(),
+            input_json: serde_json::to_string(&serde_json::json!({
+                "subject": params.subject,
+                "from": params.from,
+                "to": params.to,
+                "period_type": period_type,
+            })).unwrap_or_default(),
+            result_json: None,
+            error_message: None,
+            progress_message: Some("等待执行".to_string()),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        };
 
-        match generator.generate(
-            &params.subject,
-            from_date.and_hms_opt(0, 0, 0).unwrap(),
-            to_date.and_hms_opt(23, 59, 59).unwrap(),
-            &period_type,
-        ).await {
-            Ok(summary) => json_ok(serde_json::json!({
-                "type": "summary",
-                "id": summary.id,
-                "subject": summary.subject,
-                "period_type": summary.period_type,
-                "period_start_text": params.from,
-                "period_end_text": params.to,
-                "common_reasons": summary.common_reasons,
-                "common_suggestions": summary.common_suggestions,
-                "weak_points": serde_json::from_str::<Vec<String>>(&summary.weak_points).unwrap_or_default(),
-                "detail": summary.detail,
-                "created_at": summary.created_at,
-            })),
-            Err(e) => json_err(format!("总结生成失败: {}", e)),
+        match self.repository().insert_mcp_job(&job).await {
+            Ok(_) => {
+                self.spawn_summary_job(job_id.clone(), params.subject, from_date, to_date, period_type);
+                json_ok(serde_json::json!({"type": "job", "job_id": job_id, "kind": JOB_KIND_GENERATE_SUMMARY, "status": "queued"}))
+            }
+            Err(e) => json_err(format!("提交总结任务失败: {}", e)),
         }
     }
 
-    #[tool(description = "生成巩固练习题：基于阶段性总结生成新的练习题目，可选输出 PDF")]
+    #[tool(description = "提交巩固练习题任务：立即返回 job_id，后续通过 get_job_status / get_job_result 轮询结果")]
     async fn generate_practice(&self, params: Parameters<PracticeParams>) -> String {
         let params = params.0;
         let count = params.count.unwrap_or(10);
 
-        let _guard = self.concurrency.lock().await;
-        let generator = PracticeGenerator::new(
-            (*self.config).clone(),
-            (*self.chat_client).clone(),
-            self.repository(),
-        );
+        let job_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let job = crate::db::models::McpJob {
+            id: job_id.clone(),
+            kind: JOB_KIND_GENERATE_PRACTICE.to_string(),
+            status: "queued".to_string(),
+            input_json: serde_json::to_string(&serde_json::json!({
+                "summary_id": params.summary_id,
+                "count": count,
+                "requirements": params.requirements,
+                "output_path": params.output_path,
+            })).unwrap_or_default(),
+            result_json: None,
+            error_message: None,
+            progress_message: Some("等待执行".to_string()),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        };
 
-        match generator
-            .generate(&params.summary_id, count, params.requirements.as_deref(), None)
-            .await
-        {
-            Ok(practice) => {
-                let questions: Vec<PracticeQuestion> = serde_json::from_str(&practice.questions).unwrap_or_default();
-                let mut pdf_path = practice.pdf_path.clone();
-                if let Some(ref path) = params.output_path {
-                    match crate::pdf::generate_pdf(&practice, &self.config.pdf, path) {
-                        Ok(pdf_out) => pdf_path = Some(pdf_out.path),
-                        Err(e) => return json_err(format!("PDF 生成失败: {}", e)),
-                    }
-                }
-                json_ok(serde_json::json!({
-                    "type": "practice",
-                    "id": practice.id,
-                    "summary_id": practice.summary_id,
-                    "subject": practice.subject,
-                    "requirements": practice.requirements,
-                    "questions": questions,
-                    "question_count": questions.len(),
-                    "pdf_path": pdf_path,
-                    "created_at": practice.created_at,
-                }))
+        match self.repository().insert_mcp_job(&job).await {
+            Ok(_) => {
+                self.spawn_practice_job(job_id.clone(), params.summary_id, count, params.requirements, params.output_path);
+                json_ok(serde_json::json!({"type": "job", "job_id": job_id, "kind": JOB_KIND_GENERATE_PRACTICE, "status": "queued"}))
             }
-            Err(e) => json_err(format!("练习生成失败: {}", e)),
+            Err(e) => json_err(format!("提交练习任务失败: {}", e)),
         }
     }
 
@@ -575,7 +793,7 @@ impl McpHandler {
 impl ServerHandler for McpHandler {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo::default()
-            .with_instructions("错题本 AI 助手：支持 analyze -> summary -> practice -> pdf 工作流。优先用 list_* 查找 ID，再用 show_* 获取完整内容；用户已有 summary_id 或 practice_id 时应直接复用，避免重复调用 LLM。")
+            .with_instructions("错题本 AI 助手：长耗时任务（analyze_error / generate_summary / generate_practice）会立即返回 job_id。请继续调用 get_job_status / get_job_result 轮询，不要等待单次 tools/call 阻塞完成。读取类工具 show_* / list_* 可直接同步调用。")
     }
 }
 

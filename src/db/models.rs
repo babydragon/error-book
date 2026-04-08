@@ -79,6 +79,22 @@ pub struct PracticeSet {
     pub created_at: i64,
 }
 
+/// MCP 后台任务
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpJob {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub input_json: String,
+    pub result_json: Option<String>,
+    pub error_message: Option<String>,
+    pub progress_message: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
 /// ============ 业务请求/响应模型 ============
 
 /// 错题分析请求

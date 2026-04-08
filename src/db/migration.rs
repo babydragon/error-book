@@ -44,6 +44,21 @@ CREATE TABLE IF NOT EXISTS practice_sets (
     created_at INTEGER NOT NULL
 );
 
+-- MCP 后台任务表
+CREATE TABLE IF NOT EXISTS mcp_jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    input_json TEXT NOT NULL,
+    result_json TEXT,
+    error_message TEXT,
+    progress_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    started_at INTEGER,
+    completed_at INTEGER
+);
+
 -- 分类标签子表
 CREATE TABLE IF NOT EXISTS error_classification_tags (
     error_id TEXT NOT NULL REFERENCES error_records(id) ON DELETE CASCADE,
@@ -56,6 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_errors_created_at ON error_records(created_at);
 CREATE INDEX IF NOT EXISTS idx_summaries_subject ON summaries(subject, period_start);
 CREATE INDEX IF NOT EXISTS idx_ect_tag ON error_classification_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_ect_error_id ON error_classification_tags(error_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_jobs_kind_status ON mcp_jobs(kind, status, created_at);
 
 -- 向量索引
 CREATE INDEX IF NOT EXISTS idx_error_text_embedding ON error_records(libsql_vector_idx(text_embedding));

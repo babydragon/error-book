@@ -35,3 +35,9 @@ font_path = "./fonts/NotoSansSC-Regular.ttf"
 [search]
 # 混合搜索时图片 embedding 的权重 (0.0~1.0)，文本权重 = 1.0 - image_weight
 image_weight = 0.3
+
+[logging]
+# 默认日志级别
+level = "info"
+# 可选：日志文件路径。未配置时仅输出到 stderr
+# file = "./data/error-book.log"
