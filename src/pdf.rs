@@ -198,8 +198,8 @@ fn build_typst_markup(questions: &[PracticeQuestion], subject: &str, font_family
         ));
         m.push_str("#v(4pt)\n\n");
 
-        let question_text = escape_typst(&sanitize_text(&q.question));
-        for line in question_text.lines() {
+        let question_markup = render_question_markup(&q.question);
+        for line in question_markup.lines() {
             m.push_str(line);
             m.push('\n');
         }
@@ -277,6 +277,68 @@ fn escape_typst(s: &str) -> String {
         }
     }
     out
+}
+
+fn render_question_markup(s: &str) -> String {
+    let text = sanitize_text(s);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(text.len() + 32);
+
+    while i < chars.len() {
+        if let Some((consumed, width_mm)) = match_blank_at(&chars[i..]) {
+            out.push_str(&blank_markup(width_mm));
+            i += consumed;
+            continue;
+        }
+
+        out.push_str(&escape_typst(&chars[i].to_string()));
+        i += 1;
+    }
+
+    out
+}
+
+fn match_blank_at(chars: &[char]) -> Option<(usize, usize)> {
+    if chars.is_empty() {
+        return None;
+    }
+
+    let first = chars[0];
+    if first == '（' || first == '(' {
+        let closing = if first == '（' { '）' } else { ')' };
+        let mut j = 1usize;
+        while j < chars.len() && chars[j] != closing {
+            j += 1;
+        }
+        if j < chars.len() {
+            let inner: String = chars[1..j].iter().collect();
+            let trimmed = inner.trim();
+            let looks_blank = trimmed.is_empty()
+                || trimmed
+                    .chars()
+                    .all(|c| c == '_' || c == '＿' || c.is_whitespace());
+            if looks_blank {
+                let blank_len = inner.chars().filter(|c| *c == '_' || *c == '＿').count();
+                return Some((j + 1, blank_spaces(blank_len)));
+            }
+        }
+    }
+
+    None
+}
+
+fn blank_spaces(blank_len: usize) -> usize {
+    match blank_len {
+        0..=2 => 6,
+        3..=4 => 8,
+        5..=6 => 10,
+        _ => 12,
+    }
+}
+
+fn blank_markup(space_count: usize) -> String {
+    format!("（{}）", "　".repeat(space_count))
 }
 
 fn is_emoji_like(ch: char) -> bool {
@@ -430,5 +492,20 @@ mod tests {
         // ✅ U+2705 is in the filtered range; it should be removed.
         assert_eq!(sanitize_text("✅ done"), "done");
         assert_eq!(sanitize_text("  clean  "), "clean");
+    }
+
+    #[test]
+    fn test_render_question_markup_expands_parenthesis_blank() {
+        let rendered = render_question_markup("请填空：大 - （  ）\n多 - ( )");
+        assert!(rendered.contains("（　　　"));
+        assert!(!rendered.contains("（  ）"));
+        assert!(!rendered.contains("( )"));
+    }
+
+    #[test]
+    fn test_render_question_markup_expands_underscores() {
+        let rendered = render_question_markup("请填写 ____ 和 ______");
+        assert!(rendered.contains("\\_\\_\\_\\_"));
+        assert!(rendered.contains("\\_\\_\\_\\_\\_\\_"));
     }
 }
