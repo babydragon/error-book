@@ -11,6 +11,7 @@ Use this skill when the user wants to review accumulated wrong answers, generate
 ## Primary tools
 
 - `generate_summary`
+- `generate_summary_image`
 - `get_job_status`
 - `get_job_result`
 - `show_summary`
@@ -31,10 +32,13 @@ Use this skill when the user wants to review accumulated wrong answers, generate
 1. Generate a summary with `generate_summary(subject, from, to, period_type)`.
 2. Poll `get_job_status(job_id)` until the job is `succeeded` or `failed`.
 3. Call `get_job_result(job_id)` to obtain the final summary payload, then use `show_summary(summary_id)` as the authoritative stored content.
-4. If the user wants practice, call `generate_practice(summary_id, count, requirements)`.
+4. If the user wants a memory infographic, call `generate_summary_image(summary_id, requirements)`.
 5. Poll `get_job_status(job_id)` until the job is `succeeded` or `failed`.
-6. Call `get_job_result(job_id)` to obtain the final practice payload, then use `show_practice(practice_id)` as the authoritative stored content.
-7. Only call `generate_practice_pdf(practice_id, output_path)` when the user explicitly wants file export or re-export.
+6. Call `get_job_result(job_id)` to obtain the final infographic payload, then use `show_summary(summary_id)` to inspect the stored image list.
+7. If the user wants practice, call `generate_practice(summary_id, count, requirements)`.
+8. Poll `get_job_status(job_id)` until the job is `succeeded` or `failed`.
+9. Call `get_job_result(job_id)` to obtain the final practice payload, then use `show_practice(practice_id)` as the authoritative stored content.
+10. Only call `generate_practice_pdf(practice_id, output_path)` when the user explicitly wants file export or re-export.
 
 ## Rules
 

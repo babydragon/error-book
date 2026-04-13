@@ -44,6 +44,16 @@ CREATE TABLE IF NOT EXISTS practice_sets (
     created_at INTEGER NOT NULL
 );
 
+-- 总结信息图表
+CREATE TABLE IF NOT EXISTS summary_images (
+    id TEXT PRIMARY KEY,
+    summary_id TEXT NOT NULL REFERENCES summaries(id),
+    prompt TEXT NOT NULL,
+    image_path TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 -- MCP 后台任务表
 CREATE TABLE IF NOT EXISTS mcp_jobs (
     id TEXT PRIMARY KEY,
@@ -69,6 +79,7 @@ CREATE TABLE IF NOT EXISTS error_classification_tags (
 CREATE INDEX IF NOT EXISTS idx_errors_subject_time ON error_records(subject, created_at);
 CREATE INDEX IF NOT EXISTS idx_errors_created_at ON error_records(created_at);
 CREATE INDEX IF NOT EXISTS idx_summaries_subject ON summaries(subject, period_start);
+CREATE INDEX IF NOT EXISTS idx_summary_images_summary_id ON summary_images(summary_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_ect_tag ON error_classification_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_ect_error_id ON error_classification_tags(error_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_jobs_kind_status ON mcp_jobs(kind, status, created_at);

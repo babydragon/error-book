@@ -16,6 +16,7 @@ use error_book::analysis::analyzer::Analyzer;
 use error_book::db::repository::Repository;
 use error_book::db::models::{ErrorRecord, ErrorRecordWithScore};
 use error_book::summary::generator::SummaryGenerator;
+use error_book::summary::image_generator::SummaryImageGenerator;
 use error_book::practice::generator::PracticeGenerator;
 use error_book::mcp::server::{McpHandler, run_mcp_server};
 
@@ -89,6 +90,7 @@ async fn main() -> Result<()> {
     let chat_client = ChatClient::new(&config);
     let embedding_client = EmbeddingClient::new(&config);
     let image_storage = ImageStorage::new(config.storage.image_dir.clone());
+    let generated_image_storage = ImageStorage::new(config.storage.generated_image_dir.clone());
 
     let search_config = config.search.clone();
     let pdf_config = config.pdf.clone();
@@ -378,6 +380,25 @@ async fn main() -> Result<()> {
             println!();
             println!("── 详细分析 ──");
             println!("{}", summary.detail);
+        }
+
+        Command::SummaryImage { summary_id, requirements } => {
+            let generator = SummaryImageGenerator::new(
+                config,
+                repository,
+                generated_image_storage,
+            );
+            println!("正在生成阶段性总结信息图...");
+            let image = generator.generate(&summary_id, requirements.as_deref()).await?;
+
+            println!("════════════════════════════════════════");
+            println!("✅ 阶段性总结信息图生成完成");
+            println!("════════════════════════════════════════");
+            println!("图片 ID:   {}", image.record.id);
+            println!("总结 ID:   {}", image.record.summary_id);
+            println!("图片格式: {}", image.record.mime_type);
+            println!("相对路径: {}", image.record.image_path);
+            println!("完整路径: {}", image.full_path.display());
         }
 
         Command::Practice { summary_id, count, requirements, output } => {

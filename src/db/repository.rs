@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::NaiveDateTime;
 
-use super::models::{ErrorRecord, ErrorRecordWithScore, McpJob, PracticeSet, Summary};
+use super::models::{ErrorRecord, ErrorRecordWithScore, McpJob, PracticeSet, Summary, SummaryImage};
 
 /// 数据访问层
 #[derive(Clone)]
@@ -373,6 +373,39 @@ impl Repository {
         }
     }
 
+    pub async fn insert_summary_image(&self, image: &SummaryImage) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO summary_images (id, summary_id, prompt, image_path, mime_type, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            libsql::params_from_iter(vec![
+                libsql::Value::from(image.id.clone()),
+                libsql::Value::from(image.summary_id.clone()),
+                libsql::Value::from(image.prompt.clone()),
+                libsql::Value::from(image.image_path.clone()),
+                libsql::Value::from(image.mime_type.clone()),
+                libsql::Value::from(image.created_at),
+            ]),
+        ).await?;
+        tracing::info!(id = %image.id, summary_id = %image.summary_id, "总结信息图已保存");
+        Ok(())
+    }
+
+    pub async fn list_summary_images(&self, summary_id: &str) -> Result<Vec<SummaryImage>> {
+        let conn = self.conn()?;
+        let mut rows = conn
+            .query(
+                "SELECT id, summary_id, prompt, image_path, mime_type, created_at FROM summary_images WHERE summary_id = ?1 ORDER BY created_at DESC",
+                [summary_id],
+            )
+            .await?;
+
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().await? {
+            items.push(row_to_summary_image(&row)?);
+        }
+        Ok(items)
+    }
+
     // ===== 巩固练习 =====
 
     /// 按 ID 查询练习集
@@ -643,6 +676,17 @@ fn row_to_practice_set(row: &libsql::Row) -> Result<PracticeSet> {
         questions: row.get::<String>(4)?,
         pdf_path: row.get::<Option<String>>(5)?,
         created_at: row.get::<i64>(6)?,
+    })
+}
+
+fn row_to_summary_image(row: &libsql::Row) -> Result<SummaryImage> {
+    Ok(SummaryImage {
+        id: row.get::<String>(0)?,
+        summary_id: row.get::<String>(1)?,
+        prompt: row.get::<String>(2)?,
+        image_path: row.get::<String>(3)?,
+        mime_type: row.get::<String>(4)?,
+        created_at: row.get::<i64>(5)?,
     })
 }
 

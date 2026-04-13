@@ -221,3 +221,57 @@ pub fn build_practice_fill_prompt(
         super::client::ChatMessage::user_text(&user),
     ]
 }
+
+/// 构建阶段性总结信息图提示词
+pub fn build_summary_infographic_prompt(
+    subject: &str,
+    grade_level: &str,
+    summary: &crate::db::models::Summary,
+    weak_points: &[String],
+    extra_requirements: Option<&str>,
+) -> String {
+    let extra = extra_requirements
+        .map(|v| format!("\n补充要求：{}", v))
+        .unwrap_or_default();
+
+    format!(
+        r#"请生成一张适合{}学生记忆复习的{}教育信息图。
+
+目标：帮助孩子巩固这阶段还没有完全掌握的知识点，方便记忆、复习和反复查看。
+
+画面要求：
+1. 整体风格温和、鼓励式、儿童友好，适合小学生
+2. 中文排版清晰，标题醒目，信息分区明确
+3. 使用图标、箭头、卡片、分区块帮助记忆
+4. 内容聚焦“薄弱知识点 + 核心规则/口诀 + 易混淆点 + 记忆提醒”
+5. 重点是帮助孩子记住知识点，不是分析错误过程，不要把画面做成教师批改报告
+6. 可以适当加入简短示例、对比提示、步骤提醒，但必须简洁、直观、易记
+7. 避免过多小字，避免复杂背景，确保可读性
+8. 不要出现真人照片、品牌 logo、英文大段文字、血腥或成人元素
+9. 输出为单张信息图，适合作为学习海报保存或直接打印复习
+
+内容组织建议：
+- 用 3~6 个小模块展示最需要巩固的知识点
+- 每个模块优先展示：知识点名称、记忆口诀/规则、一个简短提醒
+- 如果需要展示“易错点”，只保留一句简短提醒，例如“注意进位”“不要漏单位”“先审题再计算”
+- 尽量减少大段“错误原因分析”文字
+
+信息图内容依据：
+- 科目：{}
+- 共性错误原因（仅作弱参考，不要作为主体）：{}
+- 共性改进建议：{}
+- 薄弱知识点：{}
+- 详细分析：{}
+{}
+
+请直接根据这些内容生成一张“知识点巩固型阶段学习信息图”。让孩子一眼能看懂、愿意看、看完能帮助记住关键知识点。"#,
+        grade_level,
+        subject,
+        subject,
+        summary.common_reasons,
+        summary.common_suggestions,
+        weak_points.join("、"),
+        summary.detail,
+        extra,
+    )
+}

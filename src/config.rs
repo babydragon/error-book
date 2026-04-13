@@ -86,7 +86,45 @@ pub struct LlmConfig {
     pub chat: ChatProviderConfig,
     pub embedding: EmbeddingProviderConfig,
     #[serde(default)]
+    pub image: Option<ImageProviderConfig>,
+    #[serde(default)]
     pub retry: RetryConfig,
+}
+
+/// Image generation provider configuration (independent from chat / embedding)
+#[derive(Deserialize, Clone)]
+pub struct ImageProviderConfig {
+    #[serde(default)]
+    pub provider: ImageProvider,
+    pub base_url: String,
+    #[serde(skip_serializing)]
+    pub api_key: String,
+    pub model: String,
+    #[serde(default = "default_image_mime_type")]
+    pub mime_type: String,
+    #[serde(default = "default_image_aspect_ratio")]
+    pub aspect_ratio: String,
+}
+
+impl fmt::Debug for ImageProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImageProviderConfig")
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("mime_type", &self.mime_type)
+            .field("aspect_ratio", &self.aspect_ratio)
+            .finish()
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageProvider {
+    Openai,
+    #[default]
+    Google,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -136,6 +174,8 @@ pub struct DatabaseConfig {
 pub struct StorageConfig {
     pub image_dir: PathBuf,
     pub pdf_dir: PathBuf,
+    #[serde(default = "default_generated_image_dir")]
+    pub generated_image_dir: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -209,11 +249,20 @@ fn default_retryable_codes() -> Vec<u16> {
 fn default_grade_level() -> String {
     "二年级".to_string()
 }
+fn default_generated_image_dir() -> PathBuf {
+    PathBuf::from("./data/generated-images")
+}
 fn default_image_weight() -> f64 {
     0.3
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_image_mime_type() -> String {
+    "image/png".to_string()
+}
+fn default_image_aspect_ratio() -> String {
+    "3:4".to_string()
 }
 
 impl AppConfig {
@@ -226,7 +275,15 @@ impl AppConfig {
         let mut config = config;
         if let Ok(v) = std::env::var("ERROR_BOOK_LLM_API_KEY") {
             config.llm.chat.api_key = v.clone();
-            config.llm.embedding.api_key = v;
+            config.llm.embedding.api_key = v.clone();
+            if let Some(image) = config.llm.image.as_mut() {
+                image.api_key = v;
+            }
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_IMAGE_API_KEY") {
+            if let Some(image) = config.llm.image.as_mut() {
+                image.api_key = v;
+            }
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_CHAT_API_KEY") {
             config.llm.chat.api_key = v;
@@ -236,7 +293,15 @@ impl AppConfig {
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_LLM_BASE_URL") {
             config.llm.chat.base_url = v.clone();
-            config.llm.embedding.base_url = v;
+            config.llm.embedding.base_url = v.clone();
+            if let Some(image) = config.llm.image.as_mut() {
+                image.base_url = v;
+            }
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_IMAGE_BASE_URL") {
+            if let Some(image) = config.llm.image.as_mut() {
+                image.base_url = v;
+            }
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_CHAT_BASE_URL") {
             config.llm.chat.base_url = v;
@@ -260,6 +325,21 @@ impl AppConfig {
                     other
                 ),
             };
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_IMAGE_PROVIDER") {
+            let provider = match v.to_ascii_lowercase().as_str() {
+                "google" => ImageProvider::Google,
+                "openai" => ImageProvider::Openai,
+                other => anyhow::bail!("不支持的 image provider: {}，仅支持 google/openai", other),
+            };
+            if let Some(image) = config.llm.image.as_mut() {
+                image.provider = provider;
+            }
+        }
+        if let Ok(v) = std::env::var("ERROR_BOOK_IMAGE_MODEL") {
+            if let Some(image) = config.llm.image.as_mut() {
+                image.model = v;
+            }
         }
         if let Ok(v) = std::env::var("ERROR_BOOK_DB_URL") {
             config.database.url = v;
@@ -291,12 +371,29 @@ impl AppConfig {
         )
     }
 
+    pub fn image_api_url(&self) -> Option<String> {
+        self.llm.image.as_ref().map(|image| {
+            let base = image.base_url.trim_end_matches('/');
+            if image.model.starts_with("gemini-") {
+                format!("{}/v1beta/models/{}:generateContent", base, image.model)
+            } else {
+                format!("{}/v1beta/models/{}:predict", base, image.model)
+            }
+        })
+    }
+
     /// 确保存储目录存在
     pub fn ensure_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.storage.image_dir)
             .with_context(|| format!("创建图片目录失败: {}", self.storage.image_dir.display()))?;
         std::fs::create_dir_all(&self.storage.pdf_dir)
             .with_context(|| format!("创建PDF目录失败: {}", self.storage.pdf_dir.display()))?;
+        std::fs::create_dir_all(&self.storage.generated_image_dir).with_context(|| {
+            format!(
+                "创建生成图片目录失败: {}",
+                self.storage.generated_image_dir.display()
+            )
+        })?;
         if let Some(path) = &self.logging.file {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
@@ -318,6 +415,9 @@ impl AppConfig {
         if self.storage.pdf_dir.is_relative() {
             self.storage.pdf_dir = base_dir.join(&self.storage.pdf_dir);
         }
+        if self.storage.generated_image_dir.is_relative() {
+            self.storage.generated_image_dir = base_dir.join(&self.storage.generated_image_dir);
+        }
         if self.pdf.font_path.is_relative() {
             self.pdf.font_path = base_dir.join(&self.pdf.font_path);
         }
@@ -331,7 +431,9 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.validate_pdf_font()
+        self.validate_pdf_font()?;
+        self.validate_image_config()?;
+        Ok(())
     }
 
     fn validate_pdf_font(&self) -> Result<()> {
@@ -354,6 +456,27 @@ impl AppConfig {
         if typst::text::Font::iter(data).next().is_none() {
             anyhow::bail!("PDF 字体文件无法解析为有效字体: {}", path.display());
         }
+        Ok(())
+    }
+
+    fn validate_image_config(&self) -> Result<()> {
+        let Some(image) = &self.llm.image else {
+            return Ok(());
+        };
+
+        if image.base_url.trim().is_empty() {
+            anyhow::bail!("llm.image.base_url 未配置");
+        }
+        if image.api_key.trim().is_empty() {
+            anyhow::bail!("llm.image.api_key 未配置");
+        }
+        if image.model.trim().is_empty() {
+            anyhow::bail!("llm.image.model 未配置");
+        }
+        if !matches!(image.provider, ImageProvider::Google) {
+            anyhow::bail!("当前仅支持 llm.image.provider=google");
+        }
+
         Ok(())
     }
 }

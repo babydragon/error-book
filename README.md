@@ -11,6 +11,7 @@
 | 列出错题记录 | ✅ | ✅ |
 | 语义搜索错题 | ✅ | ✅ |
 | 生成阶段性总结 | ✅ | ✅ |
+| 生成阶段性总结信息图 | ✅ | ✅ |
 | 生成巩固练习 | ✅ | ✅ |
 | 输出练习 PDF | ✅ | ✅ |
 | 从已存储练习集导出 PDF | ✅ | — |
@@ -54,6 +55,14 @@ api_key = "your-embedding-api-key"
 model = "gemini-embedding-2-preview"
 dimensions = 1536
 
+[llm.image]
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-image-api-key"
+model = "gemini-3.1-flash-image-preview"
+mime_type = "image/png"
+aspect_ratio = "3:4"
+
 [llm.retry]
 max_attempts = 5
 base_delay_ms = 500
@@ -67,6 +76,7 @@ url = "./data/error_book.db"
 [storage]
 image_dir = "./data/images"
 pdf_dir = "./data/pdfs"
+generated_image_dir = "./data/generated-images"
 
 [defaults]
 grade_level = "二年级"
@@ -96,18 +106,25 @@ level = "info"
 | `ERROR_BOOK_CHAT_PROVIDER` | 覆盖 `llm.chat.provider`（`google`/`openai`） |
 | `ERROR_BOOK_EMBEDDING_BASE_URL` | 覆盖 `llm.embedding.base_url` |
 | `ERROR_BOOK_EMBEDDING_PROVIDER` | 覆盖 `llm.embedding.provider`（`google`/`openai`） |
-| `ERROR_BOOK_LLM_API_KEY` | 同时覆盖 `llm.chat.api_key` 和 `llm.embedding.api_key` |
-| `ERROR_BOOK_LLM_BASE_URL` | 同时覆盖 `llm.chat.base_url` 和 `llm.embedding.base_url` |
+| `ERROR_BOOK_IMAGE_API_KEY` | 覆盖 `llm.image.api_key` |
+| `ERROR_BOOK_IMAGE_BASE_URL` | 覆盖 `llm.image.base_url` |
+| `ERROR_BOOK_IMAGE_PROVIDER` | 覆盖 `llm.image.provider` |
+| `ERROR_BOOK_IMAGE_MODEL` | 覆盖 `llm.image.model` |
+| `ERROR_BOOK_LLM_API_KEY` | 同时覆盖 `llm.chat.api_key`、`llm.embedding.api_key` 和 `llm.image.api_key` |
+| `ERROR_BOOK_LLM_BASE_URL` | 同时覆盖 `llm.chat.base_url`、`llm.embedding.base_url` 和 `llm.image.base_url` |
 | `ERROR_BOOK_DB_URL` | 覆盖 `database.url` |
 
 说明：
 - chat 和 embedding 现在可以分别配置不同来源的 `base_url`、`api_key` 和 `model`
 - `llm.chat.provider` 用于选择 chat 协议，支持 `openai` / `google`
 - `llm.embedding.provider` 用于选择 embedding 协议，目前支持 `google` / `openai`
-- `llm.retry` 仍然是两者共用
+- `llm.image` 用于图片生成，当前仅实现并支持 `provider = "google"`
+- `llm.retry` 仍然是三者共用
 - chat: `openai` 与 `google` 都已实现
 - embedding: 当前仅 `provider = "google"` 已实现；`openai` 预留但暂未实现
+- image: 当前仅 `provider = "google"` 已实现；支持 Google Gemini 图片模型（如 `gemini-3.1-flash-image-preview`）和 Imagen 模型（如 `imagen-4.0-generate-001`）
 - 当 `provider = "google"` 时，`base_url` 应填写 Google 原生接口根地址，而不是 `/openai/` 兼容地址
+- `storage.generated_image_dir` 用于保存生成的阶段性总结信息图
 - `pdf.font_path` 为必填项；程序启动时会校验字体文件存在且可解析，不再使用默认回退字体
 - 日志默认写入 stderr；可通过 `logging.level` 配置日志级别，并通过 `logging.file` 追加写入日志文件
 
@@ -295,6 +312,27 @@ error-book summary -s 数学 --from 2025-03-03 --to 2025-03-09
 error-book summary -s 数学 --from 2025-03-01 --to 2025-03-31 -t month
 ```
 
+### 基于总结生成记忆信息图
+
+```bash
+error-book summary-image --summary-id <ID> [选项]
+```
+
+| 选项 | 说明 |
+|------|------|
+| `--summary-id <ID>` | 总结记录 ID（必填） |
+| `-r, --requirements <文本>` | 补充要求，如配色、版式、风格 |
+
+示例：
+
+```bash
+# 为指定总结生成帮助孩子记忆的信息图
+error-book summary-image --summary-id abc12345-...
+
+# 指定额外风格要求
+error-book summary-image --summary-id abc12345-... -r "颜色更活泼，分区更明显，适合贴在书桌前"
+```
+
 ### 生成巩固练习
 
 ```bash
@@ -367,6 +405,7 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 | `get_job_result` | 获取后台任务结果 |
 | `search_errors` | 语义搜索错题 |
 | `generate_summary` | 提交阶段性总结任务 |
+| `generate_summary_image` | 根据已有总结生成记忆信息图 |
 | `generate_practice` | 提交巩固练习题任务（支持额外要求） |
 | `generate_practice_pdf` | 按已有练习集 ID 导出 PDF |
 
@@ -401,6 +440,7 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 
 2. **阶段性总结 / 生成练习 / 导出 PDF**
    - `generate_summary` -> `get_job_status` / `get_job_result` -> `show_summary`
+   - `generate_summary_image` -> `get_job_status` / `get_job_result` -> `show_summary`
    - `generate_practice` -> `get_job_status` / `get_job_result` -> `show_practice`
    - `generate_practice_pdf`
 
@@ -434,8 +474,10 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
    └─→ error-book search -q "两位数乘法"
 4. 阶段性总结（如每周末）
    └─→ error-book summary -s 数学 --from 2025-03-03 --to 2025-03-09
-5. 生成巩固练习 + PDF
-    └─→ error-book practice --summary-id <ID> -o ./练习.pdf
+5. 生成阶段性总结信息图
+   └─→ error-book summary-image --summary-id <ID>
+6. 生成巩固练习 + PDF
+     └─→ error-book practice --summary-id <ID> -o ./练习.pdf
 ```
 
 ## 系统设计
@@ -454,24 +496,24 @@ MCP Server 通过 stdin/stdout 通信，提供以下工具：
 │  ┌─────────────────────────────────────────────────────────┐  │
 │  │                    业务服务层                             │  │
 │  │  ┌───────────┐  ┌───────────┐  ┌────────────────────┐  │  │
-│  │  │  分析服务  │  │  总结服务  │  │   巩固练习服务      │  │  │
-│  │  │ Analyzer  │  │ Generator │  │ PracticeGenerator  │  │  │
-│  │  └─────┬─────┘  └─────┬─────┘  └─────────┬──────────┘  │  │
-│  │        └──────────────┼──────────────────┘              │  │
+│  │  │  分析服务  │  │  总结服务  │  │ 信息图服务 │  │ 巩固练习服务 │  │
+│  │  │ Analyzer  │  │ Generator │  │ ImageGen  │  │ PracticeGen │  │
+│  │  └─────┬─────┘  └─────┬─────┘  └────┬─────┘  └────┬──────┘  │
+│  │        └──────────────┼─────────────┼──────────────┘         │
 │  │                       ▼                                  │  │
 │  │  ┌───────────────────────────────────────────────────┐  │  │
 │  │  │               LLM 客户端层                         │  │  │
-│  │  │   ┌───────────┐          ┌─────────────┐          │  │  │
-│  │  │   │  Chat API │          │  Embedding   │          │  │  │
-│  │  │   │  Client   │          │   Client     │          │  │  │
-│  │  │   └───────────┘          └─────────────┘          │  │  │
+│  │  │   ┌───────────┐   ┌─────────────┐   ┌───────────┐ │  │  │
+│  │  │   │  Chat API │   │ Embedding   │   │ Image API │ │  │  │
+│  │  │   │  Client   │   │   Client    │   │  Client   │ │  │  │
+│  │  │   └───────────┘   └─────────────┘   └───────────┘ │  │  │
 │  │  └───────────────────────────────────────────────────┘  │  │
 │  │                       ▼                                  │  │
 │  │  ┌───────────────────────────────────────────────────┐  │  │
 │  │  │                 数据持久化层                        │  │  │
 │  │  │   ┌──────────┐  ┌──────────┐  ┌──────────────┐   │  │  │
-│  │  │   │  libsql   │  │  文件存储  │  │   PDF 输出    │   │  │  │
-│  │  │   │ (向量 DB) │  │  (图片)   │  │  (Typst)     │   │  │  │
+│  │  │   │  libsql   │  │ 文件存储 │  │   PDF 输出    │   │  │  │
+│  │  │   │ (向量 DB) │  │(原图/信息图)│ │  (Typst)     │   │  │  │
 │  │  │   └──────────┘  └──────────┘  └──────────────┘   │  │  │
 │  │  └───────────────────────────────────────────────────┘  │  │
 │  └─────────────────────────────────────────────────────────┘  │
@@ -489,11 +531,12 @@ src/
 │   ├── analyzer.rs          # 错题分析编排（图片→LLM→解析→embedding→入库）
 │   └── parser.rs            # LLM 响应解析（markdown + JSON 容错提取）
 ├── summary/
-│   └── generator.rs         # 阶段性总结生成
+│   ├── generator.rs         # 阶段性总结生成
+│   └── image_generator.rs   # 总结信息图生成
 ├── practice/
 │   └── generator.rs         # 巩固题目生成
 ├── db/
-│   ├── models.rs            # 数据模型（ErrorRecord / Summary / PracticeSet）
+│   ├── models.rs            # 数据模型（ErrorRecord / Summary / SummaryImage / PracticeSet）
 │   ├── migration.rs         # 数据库 Schema（内联 SQL）
 │   └── repository.rs        # 数据访问层（CRUD + 向量搜索）
 ├── llm/
@@ -539,6 +582,15 @@ Summary (阶段性总结)
 ├── related_error_ids JSON  (关联错题 ["id1","id2",...])
 └── created_at       Integer
         │ 1:N
+        ▼
+SummaryImage (总结信息图)
+├── id               String (UUID)
+├── summary_id       String (FK → summaries)
+├── prompt           String
+├── image_path       String (生成图片路径)
+├── mime_type        String
+└── created_at       Integer
+        │ N:1
         ▼
 PracticeSet (巩固练习)
 ├── id               String (UUID)
@@ -598,6 +650,21 @@ ClassificationTag (分类标签子表)
    解析总结结果 → 存入 summaries 表
 ```
 
+#### 总结信息图生成
+
+```
+总结 ID + 可选补充要求
+        │
+        ▼
+   读取 summaries 表中的总结内容
+        │
+        ▼
+   构建中文信息图 Prompt → 调用 Google 图片生成接口
+        │
+        ├──→ 保存图片到 generated_image_dir
+        └──→ 存入 summary_images 表
+```
+
 #### 巩固练习 + PDF
 
 ```
@@ -626,7 +693,7 @@ ClassificationTag (分类标签子表)
 
 #### LLM 调用重试
 
-指数退避 + 随机抖动，可重试状态码：429, 5xx，网络超时/连接错误。默认 5 次重试，基础延迟 500ms，最大延迟 30s。Chat 和 Embedding 共享同一重试逻辑。
+指数退避 + 随机抖动，可重试状态码：429, 5xx，网络超时/连接错误。默认 5 次重试，基础延迟 500ms，最大延迟 30s。Chat、Embedding、Image 共用同一套重试配置。
 
 #### LLM 响应解析
 
@@ -644,6 +711,8 @@ Chat 和 Embedding 使用不同 API 格式：
 #### 图片存储
 
 原始图片复制到配置的存储目录，以 `{uuid}.{ext}` 命名，数据库存相对路径。避免原始图片被移动/删除后丢失。
+
+生成的信息图会保存到 `storage.generated_image_dir`，并在 `summary_images` 表中记录与总结的关联关系。
 
 #### CLI 与 MCP 代码复用
 

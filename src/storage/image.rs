@@ -43,6 +43,24 @@ impl ImageStorage {
         Ok(file_name)
     }
 
+    /// 保存字节内容到存储目录，返回存储后的相对路径
+    pub async fn save_bytes(&self, bytes: &[u8], extension: &str) -> Result<String> {
+        tokio::fs::create_dir_all(&self.base_dir)
+            .await
+            .with_context(|| format!("创建图片存储目录失败: {}", self.base_dir.display()))?;
+
+        let clean_extension = extension.trim_start_matches('.');
+        let file_name = format!("{}.{}", Uuid::new_v4(), clean_extension);
+        let dest_path = self.base_dir.join(&file_name);
+
+        tokio::fs::write(&dest_path, bytes)
+            .await
+            .with_context(|| format!("写入图片失败: {}", dest_path.display()))?;
+
+        tracing::info!("图片已保存: {}", dest_path.display());
+        Ok(file_name)
+    }
+
     /// 根据相对路径获取完整路径
     pub fn full_path(&self, relative_path: &str) -> PathBuf {
         self.base_dir.join(relative_path)

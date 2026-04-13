@@ -66,6 +66,17 @@ pub struct Summary {
     pub created_at: i64,
 }
 
+/// 总结信息图
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryImage {
+    pub id: String,
+    pub summary_id: String,
+    pub prompt: String,
+    pub image_path: String,
+    pub mime_type: String,
+    pub created_at: i64,
+}
+
 /// 巩固练习
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PracticeSet {

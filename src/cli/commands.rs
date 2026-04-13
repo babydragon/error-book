@@ -121,6 +121,16 @@ pub enum Command {
         period_type: String,
     },
 
+    /// 基于阶段性总结生成帮助记忆的信息图
+    SummaryImage {
+        /// 总结记录 ID
+        #[arg(long)]
+        summary_id: String,
+        /// 补充要求（如风格、配色、版式等）
+        #[arg(short = 'r', long)]
+        requirements: Option<String>,
+    },
+
     /// 生成巩固练习
     Practice {
         /// 总结记录 ID

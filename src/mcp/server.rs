@@ -20,6 +20,7 @@ use crate::llm::client::{ChatClient, EmbeddingClient};
 use crate::practice::generator::PracticeGenerator;
 use crate::storage::image::ImageStorage;
 use crate::summary::generator::SummaryGenerator;
+use crate::summary::image_generator::SummaryImageGenerator;
 
 fn json_ok(data: serde_json::Value) -> String {
     serde_json::json!({
@@ -74,6 +75,7 @@ pub struct McpHandler {
 
 const JOB_KIND_ANALYZE_ERROR: &str = "analyze_error";
 const JOB_KIND_GENERATE_SUMMARY: &str = "generate_summary";
+const JOB_KIND_GENERATE_SUMMARY_IMAGE: &str = "generate_summary_image";
 const JOB_KIND_GENERATE_PRACTICE: &str = "generate_practice";
 
 impl McpHandler {
@@ -228,6 +230,39 @@ impl McpHandler {
             }
         });
     }
+
+    fn spawn_summary_image_job(&self, job_id: String, summary_id: String, requirements: Option<String>) {
+        let config = (*self.config).clone();
+        let repository = self.repository();
+        let image_storage = ImageStorage::new(config.storage.generated_image_dir.clone());
+        let concurrency = Arc::clone(&self.concurrency);
+
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let _ = repository.mark_mcp_job_running(&job_id, Some("正在生成总结信息图"), now).await;
+            let _guard = concurrency.lock().await;
+            let generator = SummaryImageGenerator::new(config, repository.clone(), image_storage);
+
+            match generator.generate(&summary_id, requirements.as_deref()).await {
+                Ok(image) => {
+                    let result = serde_json::json!({
+                        "type": "summary_image",
+                        "id": image.record.id,
+                        "summary_id": image.record.summary_id,
+                        "prompt": image.record.prompt,
+                        "image_path": image.record.image_path,
+                        "mime_type": image.record.mime_type,
+                        "full_path": image.full_path,
+                        "created_at": image.record.created_at,
+                    });
+                    let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+                Err(e) => {
+                    let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
 }
 
 // ============ Tool parameter structs ============
@@ -308,6 +343,14 @@ pub struct PracticeParams {
     pub requirements: Option<String>,
     /// PDF 输出路径（可选，不指定则仅返回文本）
     pub output_path: Option<String>,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct SummaryImageParams {
+    /// 总结记录 ID
+    pub summary_id: String,
+    /// 补充要求（可选）
+    pub requirements: Option<String>,
 }
 
 #[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -495,7 +538,12 @@ impl McpHandler {
         let params = params.0;
         let repo = self.repository();
         match repo.get_summary(&params.summary_id).await {
-            Ok(Some(s)) => json_ok(serde_json::json!({
+            Ok(Some(s)) => {
+                let images = match repo.list_summary_images(&s.id).await {
+                    Ok(images) => images,
+                    Err(e) => return json_err(format!("查询总结配图失败: {}", e)),
+                };
+                json_ok(serde_json::json!({
                 "type": "summary",
                 "id": s.id,
                 "subject": s.subject,
@@ -513,11 +561,18 @@ impl McpHandler {
                 "weak_points": serde_json::from_str::<Vec<String>>(&s.weak_points).unwrap_or_default(),
                 "related_error_ids": serde_json::from_str::<Vec<String>>(&s.related_error_ids).unwrap_or_default(),
                 "detail": s.detail,
+                "images": images.into_iter().map(|img| serde_json::json!({
+                    "id": img.id,
+                    "image_path": img.image_path,
+                    "mime_type": img.mime_type,
+                    "created_at": img.created_at,
+                })).collect::<Vec<_>>(),
                 "created_at": s.created_at,
                 "created_at_text": chrono::DateTime::from_timestamp(s.created_at, 0)
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     .unwrap_or_else(|| s.created_at.to_string()),
-            })),
+            }))
+            }
             Ok(None) => json_err(format!("未找到总结记录: {}", params.summary_id)),
             Err(e) => json_err(format!("查询失败: {}", e)),
         }
@@ -738,6 +793,38 @@ impl McpHandler {
                 json_ok(serde_json::json!({"type": "job", "job_id": job_id, "kind": JOB_KIND_GENERATE_SUMMARY, "status": "queued"}))
             }
             Err(e) => json_err(format!("提交总结任务失败: {}", e)),
+        }
+    }
+
+    #[tool(description = "提交阶段性总结信息图生成任务：根据已有 summary_id 生成帮助孩子记忆的中文信息图，立即返回 job_id")]
+    async fn generate_summary_image(&self, params: Parameters<SummaryImageParams>) -> String {
+        let params = params.0;
+
+        let job_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp();
+        let job = crate::db::models::McpJob {
+            id: job_id.clone(),
+            kind: JOB_KIND_GENERATE_SUMMARY_IMAGE.to_string(),
+            status: "queued".to_string(),
+            input_json: serde_json::to_string(&serde_json::json!({
+                "summary_id": params.summary_id,
+                "requirements": params.requirements,
+            })).unwrap_or_default(),
+            result_json: None,
+            error_message: None,
+            progress_message: Some("等待执行".to_string()),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            completed_at: None,
+        };
+
+        match self.repository().insert_mcp_job(&job).await {
+            Ok(_) => {
+                self.spawn_summary_image_job(job_id.clone(), params.summary_id, params.requirements);
+                json_ok(serde_json::json!({"type": "job", "job_id": job_id, "kind": JOB_KIND_GENERATE_SUMMARY_IMAGE, "status": "queued"}))
+            }
+            Err(e) => json_err(format!("提交总结信息图任务失败: {}", e)),
         }
     }
 

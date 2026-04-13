@@ -11,6 +11,14 @@ api_key = "your-embedding-api-key"
 model = "gemini-embedding-2-preview"
 dimensions = 1536
 
+[llm.image]
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-image-api-key"
+model = "gemini-3.1-flash-image-preview"
+mime_type = "image/png"
+aspect_ratio = "3:4"
+
 [llm.retry]
 max_attempts = 5
 base_delay_ms = 500
@@ -24,6 +32,7 @@ url = "file://./data/error_book.db"
 [storage]
 image_dir = "./data/images"
 pdf_dir = "./data/pdfs"
+generated_image_dir = "./data/generated-images"
 
 [defaults]
 grade_level = "二年级"
