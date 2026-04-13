@@ -143,17 +143,35 @@ binary_path_for() {
 
 package_dir_for() {
   local arch="$1"
-  echo "$PACKAGE_ROOT/${APP_NAME}-v${VERSION}-${arch}"
+  echo "$PACKAGE_ROOT/${APP_NAME}-${arch}"
 }
 
 archive_path_for() {
   local arch="$1"
-  echo "$PACKAGE_ROOT/${APP_NAME}-v${VERSION}-${arch}.tar.zst"
+  echo "$PACKAGE_ROOT/${APP_NAME}-${arch}.tar.zst"
 }
 
 checksum_path_for() {
   local archive_path="$1"
   echo "${archive_path}.sha256"
+}
+
+standalone_binary_path_for() {
+  local arch="$1"
+  echo "$PACKAGE_ROOT/error-${arch}"
+}
+
+write_sha256_file() {
+  local input_path="$1"
+  local output_path="$2"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$input_path" | sed "s#  $input_path#  $(basename "$input_path")#" > "$output_path"
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$(dirname "$input_path")" && shasum -a 256 "$(basename "$input_path")" > "$(basename "$output_path")")
+  else
+    echo "⚠️ 未找到 sha256sum/shasum，跳过校验文件生成" >&2
+  fi
 }
 
 package_target() {
@@ -162,11 +180,15 @@ package_target() {
   local out_dir
   local archive_path
   local checksum_path
+  local standalone_bin_path
+  local standalone_checksum_path
 
   bin_path="$(binary_path_for "$arch")"
   out_dir="$(package_dir_for "$arch")"
   archive_path="$(archive_path_for "$arch")"
   checksum_path="$(checksum_path_for "$archive_path")"
+  standalone_bin_path="$(standalone_binary_path_for "$arch")"
+  standalone_checksum_path="$(checksum_path_for "$standalone_bin_path")"
 
   if [[ ! -f "$bin_path" ]]; then
     echo "❌ 未找到构建产物: $bin_path" >&2
@@ -190,20 +212,21 @@ package_target() {
   [[ -f "$ROOT_DIR/skills/error-intake/SKILL.md" ]] && cp "$ROOT_DIR/skills/error-intake/SKILL.md" "$out_dir/skills/error-intake/SKILL.md"
   [[ -f "$ROOT_DIR/skills/summary-practice-coach/SKILL.md" ]] && cp "$ROOT_DIR/skills/summary-practice-coach/SKILL.md" "$out_dir/skills/summary-practice-coach/SKILL.md"
 
-  rm -f "$archive_path" "$checksum_path"
+  rm -f "$archive_path" "$checksum_path" "$standalone_bin_path" "$standalone_checksum_path"
+
+  cp "$bin_path" "$standalone_bin_path"
+  chmod +x "$standalone_bin_path"
+
   tar -C "$PACKAGE_ROOT" --zstd -cf "$archive_path" "$(basename "$out_dir")"
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$(basename "$archive_path")" > "$checksum_path"
-  elif command -v shasum >/dev/null 2>&1; then
-    (cd "$PACKAGE_ROOT" && shasum -a 256 "$(basename "$archive_path")" > "$(basename "$checksum_path")")
-  else
-    echo "⚠️ 未找到 sha256sum/shasum，跳过校验文件生成" >&2
-  fi
+  write_sha256_file "$archive_path" "$checksum_path"
+  write_sha256_file "$standalone_bin_path" "$standalone_checksum_path"
 
   echo "✅ 已生成目录: $out_dir"
+  echo "✅ 已生成裸二进制: $standalone_bin_path"
   echo "✅ 已生成压缩包: $archive_path"
   [[ -f "$checksum_path" ]] && echo "✅ 已生成校验文件: $checksum_path"
+  [[ -f "$standalone_checksum_path" ]] && echo "✅ 已生成校验文件: $standalone_checksum_path"
 }
 
 main() {
@@ -236,6 +259,7 @@ main() {
 
   mapfile -t TARGET_ARCHES < <(unique_arches "${raw_arches[@]}")
 
+  rm -rf "$PACKAGE_ROOT"
   mkdir -p "$PACKAGE_ROOT"
 
   local arch
