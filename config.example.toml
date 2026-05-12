@@ -12,12 +12,45 @@ model = "gemini-embedding-2-preview"
 dimensions = 1536
 
 [llm.image]
-provider = "google"
-base_url = "https://generativelanguage.googleapis.com"
+provider = "openai"
+base_url = "https://api.openai.com/v1"
 api_key = "your-image-api-key"
-model = "gemini-3.1-flash-image-preview"
+model = "gpt-image-1"
 mime_type = "image/png"
 aspect_ratio = "3:4"
+
+# ── 统一 HTTP 配置 ──────────────────────────────────────────────
+# 所有 LLM HTTP 客户端（chat / embedding / image / image_download）
+# 共享同一套 transport 默认值，每个 service 可单独 override request_timeout_secs。
+#
+# [llm.http.defaults]             # 共享 transport 默认值（以下均为默认值，可省略）
+# connect_timeout_secs = 30       # TCP 连接超时（秒）
+# http1_only = true               # 仅使用 HTTP/1.1
+# connection_close = true         # 每次请求后关闭连接（curl-like 行为）
+# disable_compression = true      # 禁用压缩协商
+# tcp_keepalive_secs = 30         # TCP keepalive（秒）
+# tcp_nodelay = true              # 禁用 Nagle 算法
+# user_agent = "error-book/0.1"   # User-Agent
+#
+# [llm.http.chat]                 # Chat 服务 override
+# request_timeout_secs = 120      # Chat 请求整体超时（秒）
+#
+# [llm.http.embedding]            # Embedding 服务 override
+# request_timeout_secs = 60       # Embedding 请求整体超时（秒）
+#
+# [llm.http.image]                # 图片生成服务 override
+# request_timeout_secs = 600      # 图片生成请求整体超时（秒），图片生成耗时长
+#
+# [llm.http.image_download]       # 图片下载服务 override
+# request_timeout_secs = 120      # 下载已生成图片的超时（秒）
+
+# ── 旧配置兼容（legacy fallback）──────────────────────────────────
+# 如果不配置 [llm.http]，以下旧字段仍然生效：
+# [llm.image]
+# connect_timeout_secs = 30       # TCP 连接超时（秒）
+# request_timeout_secs = 600      # 图片生成请求整体超时（秒）
+# download_timeout_secs = 120     # 下载已生成图片的超时（秒）
+# 优先级：llm.http.image.request_timeout_secs > llm.image.request_timeout_secs
 
 [llm.retry]
 max_attempts = 5

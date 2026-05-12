@@ -4,6 +4,111 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// ── Unified HTTP profile types ──────────────────────────────────────
+
+/// Identifies which service is requesting an HTTP client profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpServiceKind {
+    Chat,
+    Embedding,
+    Image,
+    ImageDownload,
+}
+
+/// Resolved runtime HTTP profile (defaults + override + legacy fallback).
+#[derive(Debug, Clone)]
+pub struct HttpProfile {
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+    pub http1_only: bool,
+    pub connection_close: bool,
+    pub disable_compression: bool,
+    pub tcp_keepalive: Duration,
+    pub tcp_nodelay: bool,
+    pub user_agent: String,
+}
+
+// ── Unified HTTP config model ───────────────────────────────────────
+
+/// Shared transport defaults for all HTTP clients.
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpDefaultsConfig {
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_http_http1_only")]
+    pub http1_only: bool,
+    #[serde(default = "default_http_connection_close")]
+    pub connection_close: bool,
+    #[serde(default = "default_http_disable_compression")]
+    pub disable_compression: bool,
+    #[serde(default = "default_http_tcp_keepalive_secs")]
+    pub tcp_keepalive_secs: u64,
+    #[serde(default = "default_http_tcp_nodelay")]
+    pub tcp_nodelay: bool,
+    #[serde(default = "default_http_user_agent")]
+    pub user_agent: String,
+}
+
+impl Default for HttpDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: default_http_connect_timeout_secs(),
+            http1_only: default_http_http1_only(),
+            connection_close: default_http_connection_close(),
+            disable_compression: default_http_disable_compression(),
+            tcp_keepalive_secs: default_http_tcp_keepalive_secs(),
+            tcp_nodelay: default_http_tcp_nodelay(),
+            user_agent: default_http_user_agent(),
+        }
+    }
+}
+
+/// Per-service HTTP override (only request timeout for simplicity).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HttpServiceOverride {
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
+}
+
+/// Top-level `[llm.http]` section.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub defaults: HttpDefaultsConfig,
+    #[serde(default)]
+    pub chat: HttpServiceOverride,
+    #[serde(default)]
+    pub embedding: HttpServiceOverride,
+    #[serde(default)]
+    pub image: HttpServiceOverride,
+    #[serde(default)]
+    pub image_download: HttpServiceOverride,
+}
+
+// ── HTTP default helpers ────────────────────────────────────────────
+
+fn default_http_connect_timeout_secs() -> u64 {
+    30
+}
+fn default_http_http1_only() -> bool {
+    true
+}
+fn default_http_connection_close() -> bool {
+    true
+}
+fn default_http_disable_compression() -> bool {
+    true
+}
+fn default_http_tcp_keepalive_secs() -> u64 {
+    30
+}
+fn default_http_tcp_nodelay() -> bool {
+    true
+}
+fn default_http_user_agent() -> String {
+    "error-book/0.1".to_string()
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
     pub llm: LlmConfig,
@@ -89,6 +194,9 @@ pub struct LlmConfig {
     pub image: Option<ImageProviderConfig>,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Unified HTTP transport + per-service timeout config.
+    #[serde(default)]
+    pub http: HttpConfig,
 }
 
 /// Image generation provider configuration (independent from chat / embedding)
@@ -104,6 +212,15 @@ pub struct ImageProviderConfig {
     pub mime_type: String,
     #[serde(default = "default_image_aspect_ratio")]
     pub aspect_ratio: String,
+    /// TCP 连接超时（秒），默认 30s
+    #[serde(default = "default_image_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 图片生成请求整体超时（秒），默认 600s（图片生成耗时长，远高于普通请求）
+    #[serde(default = "default_image_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// 下载已生成图片的超时（秒），默认 120s
+    #[serde(default = "default_image_download_timeout_secs")]
+    pub download_timeout_secs: u64,
 }
 
 impl fmt::Debug for ImageProviderConfig {
@@ -115,6 +232,9 @@ impl fmt::Debug for ImageProviderConfig {
             .field("model", &self.model)
             .field("mime_type", &self.mime_type)
             .field("aspect_ratio", &self.aspect_ratio)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("download_timeout_secs", &self.download_timeout_secs)
             .finish()
     }
 }
@@ -264,6 +384,15 @@ fn default_image_mime_type() -> String {
 fn default_image_aspect_ratio() -> String {
     "3:4".to_string()
 }
+fn default_image_connect_timeout_secs() -> u64 {
+    30
+}
+fn default_image_request_timeout_secs() -> u64 {
+    600
+}
+fn default_image_download_timeout_secs() -> u64 {
+    120
+}
 
 impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
@@ -374,10 +503,15 @@ impl AppConfig {
     pub fn image_api_url(&self) -> Option<String> {
         self.llm.image.as_ref().map(|image| {
             let base = image.base_url.trim_end_matches('/');
-            if image.model.starts_with("gemini-") {
-                format!("{}/v1beta/models/{}:generateContent", base, image.model)
-            } else {
-                format!("{}/v1beta/models/{}:predict", base, image.model)
+            match image.provider {
+                ImageProvider::Openai => format!("{}/images/generations", base),
+                ImageProvider::Google => {
+                    if image.model.starts_with("gemini-") {
+                        format!("{}/v1beta/models/{}:generateContent", base, image.model)
+                    } else {
+                        format!("{}/v1beta/models/{}:predict", base, image.model)
+                    }
+                }
             }
         })
     }
@@ -473,10 +607,97 @@ impl AppConfig {
         if image.model.trim().is_empty() {
             anyhow::bail!("llm.image.model 未配置");
         }
-        if !matches!(image.provider, ImageProvider::Google) {
-            anyhow::bail!("当前仅支持 llm.image.provider=google");
-        }
-
         Ok(())
     }
+
+    /// Resolve a merged `HttpProfile` for a given service.
+    ///
+    /// Resolution order:
+    /// 1. `llm.http.defaults` provides shared transport fields.
+    /// 2. `llm.http.<service>` provides the per-service `request_timeout_secs` override.
+    /// 3. Legacy fallback: if the service is Image/ImageDownload and `llm.http.*` has no
+    ///    override, fall back to the old `llm.image.{connect,request,download}_timeout_secs`.
+    pub fn resolve_http_profile(&self, kind: HttpServiceKind) -> HttpProfile {
+        let d = &self.llm.http.defaults;
+
+        let request_timeout = resolve_request_timeout(&self.llm.http, kind, self.llm.image.as_ref());
+
+        HttpProfile {
+            connect_timeout: Duration::from_secs(d.connect_timeout_secs),
+            request_timeout,
+            http1_only: d.http1_only,
+            connection_close: d.connection_close,
+            disable_compression: d.disable_compression,
+            tcp_keepalive: Duration::from_secs(d.tcp_keepalive_secs),
+            tcp_nodelay: d.tcp_nodelay,
+            user_agent: d.user_agent.clone(),
+        }
+    }
+}
+
+/// Resolve request timeout with legacy fallback for image services.
+fn resolve_request_timeout(
+    http: &HttpConfig,
+    kind: HttpServiceKind,
+    legacy_image: Option<&ImageProviderConfig>,
+) -> Duration {
+    let (override_val, default_secs) = match kind {
+        HttpServiceKind::Chat => (http.chat.request_timeout_secs, 120),
+        HttpServiceKind::Embedding => (http.embedding.request_timeout_secs, 60),
+        HttpServiceKind::Image => {
+            // Legacy fallback: llm.image.request_timeout_secs (default 600)
+            let fallback = legacy_image
+                .map(|ic| ic.request_timeout_secs)
+                .unwrap_or(default_image_request_timeout_secs());
+            (http.image.request_timeout_secs.or(Some(fallback)), default_image_request_timeout_secs())
+        }
+        HttpServiceKind::ImageDownload => {
+            // Legacy fallback: llm.image.download_timeout_secs (default 120)
+            let fallback = legacy_image
+                .map(|ic| ic.download_timeout_secs)
+                .unwrap_or(default_image_download_timeout_secs());
+            (http.image_download.request_timeout_secs.or(Some(fallback)), default_image_download_timeout_secs())
+        }
+    };
+
+    Duration::from_secs(override_val.unwrap_or(default_secs))
+}
+
+/// Build a `reqwest::Client` from a resolved `HttpProfile`.
+///
+/// Applies all shared transport settings (connect timeout, http1_only, user agent,
+/// compression control, tcp_keepalive, tcp_nodelay). Connection pool is minimised
+/// (idle timeout 1 s, max idle per host 0) for curl-like behaviour when
+/// `connection_close` is enabled.
+pub fn build_client_from_profile(profile: &HttpProfile) -> reqwest::Client {
+    let mut builder = reqwest::ClientBuilder::new()
+        .connect_timeout(profile.connect_timeout)
+        .timeout(profile.request_timeout)
+        .user_agent(&profile.user_agent)
+        .tcp_keepalive(profile.tcp_keepalive)
+        .tcp_nodelay(profile.tcp_nodelay);
+
+    if profile.http1_only {
+        builder = builder.http1_only();
+    }
+
+    // Minimise connection reuse when connection_close is enabled (curl-like behaviour)
+    if profile.connection_close {
+        builder = builder
+            .pool_idle_timeout(Duration::from_secs(1))
+            .pool_max_idle_per_host(0);
+    }
+
+    // Disable compression negotiation
+    if profile.disable_compression {
+        builder = builder
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate();
+    }
+
+    builder
+        .build()
+        .expect("failed to build reqwest Client from HttpProfile")
 }

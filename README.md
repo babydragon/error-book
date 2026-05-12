@@ -56,12 +56,35 @@ model = "gemini-embedding-2-preview"
 dimensions = 1536
 
 [llm.image]
-provider = "google"
-base_url = "https://generativelanguage.googleapis.com"
+provider = "openai"
+base_url = "https://api.openai.com/v1"
 api_key = "your-image-api-key"
-model = "gemini-3.1-flash-image-preview"
+model = "gpt-image-1"
 mime_type = "image/png"
 aspect_ratio = "3:4"
+
+# ── 统一 HTTP 配置 ──────────────────────────────────────────
+# 所有 LLM HTTP 客户端共享 transport 默认值，每个 service 可单独 override。
+# [llm.http.defaults]               # 共享 transport 默认值（以下均为默认值，可省略）
+# connect_timeout_secs = 30         # TCP 连接超时（秒）
+# http1_only = true                 # 仅使用 HTTP/1.1
+# connection_close = true           # 每次请求后关闭连接
+# disable_compression = true        # 禁用压缩协商
+# tcp_keepalive_secs = 30           # TCP keepalive（秒）
+# tcp_nodelay = true                # 禁用 Nagle 算法
+# user_agent = "error-book/0.1"     # User-Agent
+#
+# [llm.http.chat]                   # Chat 服务 override
+# request_timeout_secs = 120        # Chat 请求整体超时（秒）
+#
+# [llm.http.embedding]              # Embedding 服务 override
+# request_timeout_secs = 60         # Embedding 请求整体超时（秒）
+#
+# [llm.http.image]                  # 图片生成服务 override
+# request_timeout_secs = 600        # 图片生成请求整体超时（秒），默认 10 分钟
+#
+# [llm.http.image_download]         # 图片下载服务 override
+# request_timeout_secs = 120        # 下载已生成图片的超时（秒）
 
 [llm.retry]
 max_attempts = 5
@@ -118,12 +141,15 @@ level = "info"
 - chat 和 embedding 现在可以分别配置不同来源的 `base_url`、`api_key` 和 `model`
 - `llm.chat.provider` 用于选择 chat 协议，支持 `openai` / `google`
 - `llm.embedding.provider` 用于选择 embedding 协议，目前支持 `google` / `openai`
-- `llm.image` 用于图片生成，当前仅实现并支持 `provider = "google"`
+- `llm.image` 用于图片生成，支持 `openai` 和 `google`
 - `llm.retry` 仍然是三者共用
 - chat: `openai` 与 `google` 都已实现
 - embedding: 当前仅 `provider = "google"` 已实现；`openai` 预留但暂未实现
-- image: 当前仅 `provider = "google"` 已实现；支持 Google Gemini 图片模型（如 `gemini-3.1-flash-image-preview`）和 Imagen 模型（如 `imagen-4.0-generate-001`）
+- image: `provider = "openai"` 时可使用 OpenAI Images API（如 `gpt-image-1` / 兼容的 GPT Image 模型）；`provider = "google"` 时支持 Gemini 图片模型（如 `gemini-3.1-flash-image-preview`）和 Imagen 模型（如 `imagen-4.0-generate-001`）
 - 当 `provider = "google"` 时，`base_url` 应填写 Google 原生接口根地址，而不是 `/openai/` 兼容地址
+- 当 `provider = "openai"` 时，图片生成走独立的 Images API，而不是 chat completions
+- 统一 HTTP 配置现在放在 `[llm.http.*]` 下：`defaults` 设置共享 transport 参数（connect_timeout、http1_only 等），`chat` / `embedding` / `image` / `image_download` 可分别 override `request_timeout_secs`。默认值：connect=30s，chat=120s，embedding=60s，image=600s，image_download=120s
+- `llm.image.connect_timeout_secs / request_timeout_secs / download_timeout_secs` 仅作为 legacy fallback 保留，优先级低于 `llm.http.*`；新配置建议使用 `[llm.http.*]`
 - `storage.generated_image_dir` 用于保存生成的阶段性总结信息图
 - `pdf.font_path` 为必填项；程序启动时会校验字体文件存在且可解析，不再使用默认回退字体
 - 日志默认写入 stderr；可通过 `logging.level` 配置日志级别，并通过 `logging.file` 追加写入日志文件
@@ -721,3 +747,19 @@ Chat 和 Embedding 使用不同 API 格式：
 #### 交叉编译
 
 避免引入 `-sys` 包（C 代码编译），`reqwest` 使用 `rustls-tls` 而非 `native-tls`，支持通过 `cargo zigbuild` 交叉编译到 RISC-V 等目标平台。
+
+#### 长耗时图片生成 API 踩坑记录
+
+本项目调用 OpenAI 兼容 Images API（如 GPT Image）生成图片时，曾遇到请求超时问题，以下是经验总结：
+
+**不要用默认 `reqwest::Client::new()` 直接请求长耗时接口。** 默认 client 没有显式超时设置，在某些 OpenAI 兼容聚合平台上连接行为兼容性较差，容易卡在连接建立或等待响应阶段。之前遇到的超时并不是简单的"reqwest 内置 155s 超时"，而是默认连接行为（连接池复用、keep-alive、HTTP/2 协商等）在聚合平台代理层表现不稳定，导致请求挂起。
+
+**必须做的配置：**
+
+1. **显式设置三类超时**：`connect_timeout`（TCP 连接）、`timeout`（请求整体超时，图片生成通常需要数分钟）、下载返回图片时的独立 `timeout`
+2. **贴近 curl 行为的 client 配置**：`http1_only()`（避免 HTTP/2 协商问题）、`Connection: close`（不依赖 keep-alive）、明确 `User-Agent`、`Accept-Encoding: identity`（避免压缩协商）、设置 `tcp_keepalive`
+3. **按场景拆分 client**：图片生成请求（长超时）和图片 URL 下载请求（短超时）使用不同的 client 实例，避免超时配置互相干扰
+
+**图片 URL 下载需要短退避重试。** 生成 API 返回的图片 URL 指向 CDN/对象存储，资源可能短暂未就绪（404 或空响应），需要做 2-3 次短间隔重试（如 1s、2s）。
+
+**关于流式（streaming）的说明：** 如果后续支持 SSE/streaming，流式更适合改善用户长等待体验（逐步返回进度），但并非所有 OpenAI 兼容平台都可靠支持流式，需要按平台能力决定。

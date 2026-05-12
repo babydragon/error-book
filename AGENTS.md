@@ -38,3 +38,17 @@
 * 目标平台包含 RISC-V，使用 `cargo zigbuild` 进行交叉编译
 * 尽量避免引入 `-sys` 包（包含 C 代码编译），已知的必要 `-sys` 包（如 libsql-sys）通过 zigbuild 处理
 * reqwest 使用 `rustls-tls` 而非 `native-tls`（避免 openssl-sys）
+
+## Rust/reqwest 编码注意事项
+
+以下规则适用于所有调用 LLM / 图片生成 / 外部 HTTP 接口的场景：
+
+1. **禁止对长耗时接口直接使用 `reqwest::Client::new()`。** 默认 client 没有显式超时，在 OpenAI 兼容聚合平台场景下连接行为不稳定，容易挂起。必须用 `ClientBuilder` 显式配置。
+2. **按场景拆分 client。** 图片生成请求（可能数分钟）和图片 URL 下载（几秒）使用独立 client 实例，分别设置 `connect_timeout`、`timeout`。
+3. **必须显式配置的内容：**
+   - `connect_timeout`、`timeout`（请求整体超时）
+   - `http1_only()`、`Connection: close` header、明确 `User-Agent`、`Accept-Encoding: identity`、`tcp_keepalive`
+   - 日志：请求开始/结束/耗时/状态码必须打 log，方便排查
+4. **对返回 URL 的资源下载增加短退避重试。** CDN/对象存储可能短暂未就绪（404），做 2-3 次短间隔重试（1s、2s）。
+5. **遇到 reqwest 超时先验证 curl。** 在 OpenAI 兼容聚合平台场景下，先确认同一请求用 `curl` 能正常返回，再决定是调整 reqwest 配置还是平台本身的问题。不要假设是 reqwest 内置超时限制。
+6. **流式（streaming）非银弹。** 流式可以改善长等待体验，但不是所有 OpenAI 兼容平台都可靠支持，需要按实际平台能力决定是否启用。

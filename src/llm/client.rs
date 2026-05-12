@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::config::{AppConfig, ChatProvider, EmbeddingProvider};
+use crate::config::{AppConfig, ChatProvider, EmbeddingProvider, HttpServiceKind};
 
 /// OpenAI Chat Completions API 请求
 #[derive(Debug, Serialize)]
@@ -91,17 +91,32 @@ pub struct ChatClient {
     model: String,
     provider: ChatProvider,
     retry_config: crate::config::RetryConfig,
+    /// Whether to send Connection: close and Accept-Encoding: identity per-request
+    connection_close: bool,
+    disable_compression: bool,
 }
 
 impl ChatClient {
     pub fn new(config: &AppConfig) -> Self {
+        let profile = config.resolve_http_profile(HttpServiceKind::Chat);
+        tracing::info!(
+            request_timeout_secs = profile.request_timeout.as_secs(),
+            connect_timeout_secs = profile.connect_timeout.as_secs(),
+            http1_only = profile.http1_only,
+            connection_close = profile.connection_close,
+            disable_compression = profile.disable_compression,
+            user_agent = %profile.user_agent,
+            "Chat HTTP client 已构建 (统一 profile)"
+        );
         Self {
-            http: reqwest::Client::new(),
+            http: crate::config::build_client_from_profile(&profile),
             base_url: config.llm.chat.base_url.clone(),
             api_key: config.llm.chat.api_key.clone(),
             model: config.llm.chat.model.clone(),
             provider: config.llm.chat.provider,
             retry_config: config.llm.retry.clone(),
+            connection_close: profile.connection_close,
+            disable_compression: profile.disable_compression,
         }
     }
 
@@ -158,11 +173,20 @@ impl ChatClient {
             "发送 Chat API 请求"
         );
 
-        let response = self
+        let mut req = self
             .http
             .post(&api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        if self.connection_close {
+            req = req.header("Connection", "close");
+        }
+        if self.disable_compression {
+            req = req.header("Accept-Encoding", "identity");
+        }
+
+        let response = req
             .json(&request)
             .send()
             .await
@@ -227,6 +251,8 @@ pub struct EmbeddingClient {
     dimensions: u32,
     provider: EmbeddingProvider,
     retry_config: crate::config::RetryConfig,
+    connection_close: bool,
+    disable_compression: bool,
 }
 
 /// Google AI Studio embedContent 响应
@@ -262,11 +288,20 @@ impl ChatClient {
             "发送 Chat API 请求"
         );
 
-        let response = self
+        let mut req = self
             .http
             .post(&api_url)
             .header("x-goog-api-key", &self.api_key)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        if self.connection_close {
+            req = req.header("Connection", "close");
+        }
+        if self.disable_compression {
+            req = req.header("Accept-Encoding", "identity");
+        }
+
+        let response = req
             .json(&body)
             .send()
             .await
@@ -314,14 +349,25 @@ impl ContentPart {
 
 impl EmbeddingClient {
     pub fn new(config: &AppConfig) -> Self {
+        let profile = config.resolve_http_profile(HttpServiceKind::Embedding);
+        tracing::info!(
+            request_timeout_secs = profile.request_timeout.as_secs(),
+            connect_timeout_secs = profile.connect_timeout.as_secs(),
+            http1_only = profile.http1_only,
+            connection_close = profile.connection_close,
+            user_agent = %profile.user_agent,
+            "Embedding HTTP client 已构建 (统一 profile)"
+        );
         Self {
-            http: reqwest::Client::new(),
+            http: crate::config::build_client_from_profile(&profile),
             api_key: config.llm.embedding.api_key.clone(),
             base_url: config.llm.embedding.base_url.clone(),
             model: config.llm.embedding.model.clone(),
             dimensions: config.llm.embedding.dimensions,
             provider: config.llm.embedding.provider,
             retry_config: config.llm.retry.clone(),
+            connection_close: profile.connection_close,
+            disable_compression: profile.disable_compression,
         }
     }
 
@@ -445,11 +491,20 @@ impl EmbeddingClient {
             "发送 Embedding API 请求"
         );
 
-        let response = self
+        let mut req = self
             .http
             .post(api_url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+
+        if self.connection_close {
+            req = req.header("Connection", "close");
+        }
+        if self.disable_compression {
+            req = req.header("Accept-Encoding", "identity");
+        }
+
+        let response = req
             .json(body)
             .send()
             .await
