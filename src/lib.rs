@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod backfill;
 pub mod cli;
 pub mod config;
 pub mod db;

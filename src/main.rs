@@ -7,16 +7,18 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+use error_book::backfill::engine::{BackfillOptions, BackfillScope, run_backfill};
 use error_book::cli::commands::{Cli, Command};
-use error_book::config::AppConfig;
+use error_book::config::{AppConfig, ChatProvider, RoleKind};
 use error_book::db::migration;
 use error_book::llm::client::{ChatClient, EmbeddingClient};
 use error_book::storage::image::ImageStorage;
 use error_book::analysis::analyzer::Analyzer;
 use error_book::db::repository::Repository;
-use error_book::db::models::{ErrorRecord, ErrorRecordWithScore};
+use error_book::db::models::{BackfillStats, ErrorRecord, ErrorRecordWithScore};
 use error_book::summary::generator::SummaryGenerator;
 use error_book::summary::image_generator::SummaryImageGenerator;
+use error_book::summary::cascade_delete::{cascade_delete_summary, CascadeDeleteResult};
 use error_book::practice::generator::PracticeGenerator;
 use error_book::mcp::server::{McpHandler, run_mcp_server};
 
@@ -72,6 +74,108 @@ fn init_logging(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn log_resolved_llm_roles(config: &AppConfig) {
+    let roles = [
+        (RoleKind::VisionRecognition, "vision_recognition"),
+        (RoleKind::StructuredExtraction, "structured_extraction"),
+        (RoleKind::PedagogicalAnalysis, "pedagogical_analysis"),
+        (RoleKind::SummarySynthesis, "summary_synthesis"),
+        (RoleKind::InfographicPlanning, "infographic_planning"),
+        (RoleKind::PracticePlanning, "practice_planning"),
+        (RoleKind::PracticeGeneration, "practice_generation"),
+        (RoleKind::ImageGeneration, "image_generation"),
+        (RoleKind::Embedding, "embedding"),
+    ];
+
+    tracing::info!("LLM 角色解析结果（最终生效配置）:");
+
+    for (role_kind, role_name) in roles {
+        let resolved = config.llm.resolve_role_provider(role_kind);
+        let provider = match resolved.provider {
+            ChatProvider::Openai => "openai",
+            ChatProvider::Google => "google",
+        };
+
+        let source = match role_kind {
+            RoleKind::VisionRecognition => config
+                .llm
+                .roles
+                .vision_recognition
+                .as_deref(),
+            RoleKind::StructuredExtraction => config
+                .llm
+                .roles
+                .structured_extraction
+                .as_deref(),
+            RoleKind::PedagogicalAnalysis => config
+                .llm
+                .roles
+                .pedagogical_analysis
+                .as_deref(),
+            RoleKind::SummarySynthesis => config
+                .llm
+                .roles
+                .summary_synthesis
+                .as_deref(),
+            RoleKind::InfographicPlanning => config
+                .llm
+                .roles
+                .infographic_planning
+                .as_deref(),
+            RoleKind::PracticePlanning => config
+                .llm
+                .roles
+                .practice_planning
+                .as_deref(),
+            RoleKind::PracticeGeneration => config
+                .llm
+                .roles
+                .practice_generation
+                .as_deref(),
+            RoleKind::ImageGeneration => config
+                .llm
+                .roles
+                .image_generation
+                .as_deref(),
+            RoleKind::Embedding => config
+                .llm
+                .roles
+                .embedding
+                .as_deref(),
+        };
+
+        let source_label = match source {
+            Some(name) if config.llm.providers.contains_key(name) => format!("provider:{}", name),
+            Some(name) => format!("provider:{}(missing->legacy-fallback)", name),
+            None => "legacy-fallback".to_string(),
+        };
+
+        let thinking_label = match &resolved.thinking {
+            Some(tc) if tc.is_active() => {
+                let mut parts = Vec::new();
+                if let Some(enabled) = tc.thinking_enabled {
+                    parts.push(format!("thinking={}", if enabled { "enabled" } else { "disabled" }));
+                }
+                if let Some(effort) = tc.normalised_reasoning_effort() {
+                    parts.push(format!("effort={}", effort));
+                }
+                parts.join(", ")
+            }
+            _ => "none".to_string(),
+        };
+
+        tracing::info!(
+            role = role_name,
+            source = %source_label,
+            provider = provider,
+            base_url = %resolved.base_url,
+            model = %resolved.model,
+            thinking = %thinking_label,
+            "resolved llm role"
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -89,8 +193,10 @@ async fn main() -> Result<()> {
     let repository = Repository::new(Arc::clone(&db));
     let chat_client = ChatClient::new(&config);
     let embedding_client = EmbeddingClient::new(&config);
+    log_resolved_llm_roles(&config);
     let image_storage = ImageStorage::new(config.storage.image_dir.clone());
     let generated_image_storage = ImageStorage::new(config.storage.generated_image_dir.clone());
+    let generated_image_dir = config.storage.generated_image_dir.clone();
 
     let search_config = config.search.clone();
     let pdf_config = config.pdf.clone();
@@ -406,6 +512,7 @@ async fn main() -> Result<()> {
                 config,
                 chat_client,
                 repository,
+                generated_image_storage,
             );
             println!("正在生成巩固练习题...");
             let pdf_path_str = output.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -436,6 +543,9 @@ async fn main() -> Result<()> {
                 println!("{}", q.question);
                 println!("答案: {}", q.answer);
                 println!("知识点: {}", q.knowledge_points.join("、"));
+                if let Some(path) = q.image_path.as_deref() {
+                    println!("配图: {}", path);
+                }
                 println!();
             }
 
@@ -444,6 +554,7 @@ async fn main() -> Result<()> {
                 let pdf_output = error_book::pdf::generate_pdf(
                     &practice,
                     &pdf_config,
+                    Some(&generated_image_dir),
                     &output_path.to_string_lossy(),
                 )?;
                 println!("📄 PDF 已生成: {}", pdf_output.path);
@@ -465,12 +576,173 @@ async fn main() -> Result<()> {
             let pdf_output = error_book::pdf::generate_pdf(
                 &practice,
                 &pdf_config,
+                Some(&generated_image_dir),
                 &output.to_string_lossy(),
             )?;
             println!("📄 PDF 已生成: {}", pdf_output.path);
 
             // 更新数据库中的 pdf_path
             repository.update_practice_set_pdf_path(&id, &pdf_output.path).await?;
+        }
+
+        Command::ListBackfillRuns { scope, limit } => {
+            let runs = repository.list_backfill_runs(scope.as_deref(), Some(limit)).await?;
+
+            if runs.is_empty() {
+                println!("没有找到 backfill 运行记录");
+            } else {
+                println!("共 {} 条 backfill 运行记录：\n", runs.len());
+                for r in &runs {
+                    let started = format_timestamp(r.started_at);
+                    let stats: BackfillStats = r.stats_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or_default();
+                    let stats_display = if r.stats_json.is_some() {
+                        format!("↑{} ↓{} ⊘{} ✗{}", stats.upgraded, stats.skipped, stats.total_scanned, stats.failed)
+                    } else {
+                        "-".to_string()
+                    };
+                    let dry_tag = if r.dry_run { "[DRY-RUN] " } else { "" };
+                    println!(
+                        "{} | {}{} | {} | {} | {}",
+                        truncate(&r.id, 12),
+                        dry_tag,
+                        r.scope,
+                        r.status,
+                        stats_display,
+                        started
+                    );
+                }
+            }
+        }
+
+        Command::ShowBackfillRun { id } => {
+            let run = repository.get_backfill_run(&id).await?;
+            match run {
+                Some(r) => {
+                    let started = format_timestamp(r.started_at);
+                    let updated = format_timestamp(r.updated_at);
+                    let completed = r.completed_at.map(format_timestamp).unwrap_or_else(|| "-".to_string());
+                    let stats: Option<BackfillStats> = r.stats_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str(s).ok());
+
+                    println!("════════════════════════════════════════");
+                    println!("ID:      {}", r.id);
+                    println!("范围:    {}", r.scope);
+                    println!("状态:    {}", r.status);
+                    println!("模拟:    {}", if r.dry_run { "是" } else { "否" });
+                    println!("开始:    {}", started);
+                    println!("更新:    {}", updated);
+                    println!("完成:    {}", completed);
+                    if let Some(ref t) = r.last_table {
+                        println!("最后表:  {}", t);
+                    }
+                    if let Some(ref rid) = r.last_row_id {
+                        println!("最后ID:  {}", rid);
+                    }
+                    match stats {
+                        Some(s) => {
+                            println!("统计:    扫描={}, 升级={}, 跳过={}, 失败={}",
+                                s.total_scanned, s.upgraded, s.skipped, s.failed);
+                        }
+                        None => {
+                            println!("统计:    -");
+                        }
+                    }
+                    if let Some(ref err) = r.error_message {
+                        println!("错误:    {}", err);
+                    }
+                }
+                None => {
+                    println!("未找到 backfill 运行记录: {}", id);
+                }
+            }
+        }
+
+        Command::Backfill { scope, dry_run, limit, fail_fast } => {
+            let scope_enum = BackfillScope::from_str(&scope)
+                .ok_or_else(|| anyhow::anyhow!(
+                    "不支持的 scope: '{}'，可选值: error-records, error-records-analysis, all",
+                    scope
+                ))?;
+
+            println!("正在执行 backfill...");
+            println!("  scope:    {}", scope_enum);
+            println!("  dry-run:  {}", dry_run);
+            if let Some(lim) = limit {
+                println!("  limit:    {}", lim);
+            }
+            println!("  fail-fast: {}", fail_fast);
+
+            if matches!(scope_enum, BackfillScope::All) {
+                println!();
+                println!("注意: scope=all 仅自动运行无需人工介入的确定性迁移（error-records）。");
+                println!("      summaries、practice-sets、summary-images 等用户生成的产物将被跳过。");
+                println!("      error-records-analysis（LLM 驱动）需要单独显式执行。");
+            }
+
+            if matches!(scope_enum, BackfillScope::ErrorRecordsAnalysis) {
+                println!();
+                println!("注意: scope=error-records-analysis 会调用 LLM 对历史图片重新分析，");
+                println!("      仅填充结构化字段，不覆盖原有核心分析内容。建议先使用 --dry-run 查看。");
+            }
+
+            println!();
+
+            // error-records-analysis 需要 Analyzer 实例来调用 LLM 管线
+            let analyzer;
+            let analyzer_ref = if matches!(scope_enum, BackfillScope::ErrorRecordsAnalysis) {
+                analyzer = Some(Analyzer::new(
+                    config,
+                    chat_client,
+                    embedding_client,
+                    image_storage,
+                    repository.clone(),
+                ));
+                analyzer.as_ref()
+            } else {
+                None
+            };
+
+            let opts = BackfillOptions {
+                scope: scope_enum,
+                dry_run,
+                limit,
+                fail_fast,
+            };
+
+            let result = run_backfill(&repository, opts, analyzer_ref).await?;
+
+            println!("════════════════════════════════════════");
+            println!("{} Backfill 完成", if dry_run { "[DRY-RUN]" } else { "" });
+            println!("════════════════════════════════════════");
+            println!("Run ID:      {}", result.run_id);
+            println!("Scope:       {}", result.scope);
+            println!("扫描记录数:   {}", result.stats.total_scanned);
+            println!("升级记录数:   {}", result.stats.upgraded);
+            println!("跳过记录数:   {}", result.stats.skipped);
+            println!("失败记录数:   {}", result.stats.failed);
+            println!("Dry-run:     {}", result.dry_run);
+        }
+
+        Command::CascadeDeleteSummary { summary_id } => {
+            let result: CascadeDeleteResult = cascade_delete_summary(
+                &repository,
+                &summary_id,
+                config.storage.generated_image_dir.clone(),
+            ).await?;
+
+            println!("════════════════════════════════════════");
+            println!("✅ 级联删除总结完成");
+            println!("════════════════════════════════════════");
+            println!("总结 ID:               {}", result.summary_id);
+            println!("已删除总结信息图记录:   {} 条", result.deleted_summary_images);
+            println!("已删除练习集记录:       {} 条", result.deleted_practice_sets);
+            println!("已删除生成图片文件:     {} 个", result.deleted_generated_image_files);
+            println!();
+            println!("注意: 练习集 PDF 文件未被自动删除（可能为用户指定路径）");
         }
 
         Command::Mcp => {

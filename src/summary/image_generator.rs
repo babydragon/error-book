@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::config::{AppConfig, HttpServiceKind, ImageProvider};
-use crate::db::models::{Summary, SummaryImage};
+use crate::config::{AppConfig, ChatProvider, HttpServiceKind, RoleKind};
+use crate::db::models::{Summary, SummaryImage, DATA_VERSION_CURRENT};
 use crate::db::repository::Repository;
 use crate::storage::image::ImageStorage;
 
@@ -26,6 +26,23 @@ pub struct SummaryImageGenerator {
 pub struct GeneratedSummaryImage {
     pub record: SummaryImage,
     pub full_path: std::path::PathBuf,
+}
+
+pub struct GeneratedStoredImage {
+    pub image_path: String,
+    pub full_path: std::path::PathBuf,
+    pub mime_type: String,
+}
+
+/// Resolved image generation config that combines role-based provider info
+/// with image-specific settings from `[llm.image]`.
+struct ResolvedImageConfig {
+    provider: ChatProvider,
+    api_key: String,
+    model: String,
+    api_url: String,
+    mime_type: String,
+    aspect_ratio: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,6 +122,29 @@ impl SummaryImageGenerator {
             "图片生成 HTTP client 已构建 (统一 profile)"
         );
 
+        // Log resolved image generation provider (role-based or legacy)
+        {
+            let resolved = config.llm.resolve_role_provider(RoleKind::ImageGeneration);
+            let is_role_provider = config.llm.roles.image_generation.as_ref()
+                .and_then(|name| config.llm.providers.get(name))
+                .is_some();
+            if is_role_provider {
+                tracing::info!(
+                    model = %resolved.model,
+                    base_url = %resolved.base_url,
+                    provider = ?resolved.provider,
+                    "Image generation resolved to dedicated role provider (llm.roles.image_generation)"
+                );
+            } else {
+                tracing::info!(
+                    model = %resolved.model,
+                    base_url = %resolved.base_url,
+                    provider = ?resolved.provider,
+                    "Image generation using legacy [llm.image] config"
+                );
+            }
+        }
+
         Self {
             config,
             http,
@@ -114,6 +154,49 @@ impl SummaryImageGenerator {
             repository,
             storage,
         }
+    }
+
+    /// Resolve image generation config by mixing role-based provider with
+    /// image-specific settings from `[llm.image]`.
+    ///
+    /// - `provider/base_url/api_key/model` come from `resolve_role_provider(RoleKind::ImageGeneration)`.
+    /// - `mime_type` and `aspect_ratio` come from `[llm.image]` (or built-in defaults).
+    fn resolve_image_config(&self) -> Result<ResolvedImageConfig> {
+        let resolved = self.config.llm.resolve_role_provider(RoleKind::ImageGeneration);
+
+        // Validate that the resolved provider has non-empty connection info.
+        if resolved.base_url.trim().is_empty() {
+            anyhow::bail!(
+                "image generation provider has no base_url: configure \
+                 [llm.roles] image_generation = \"<provider>\" with a valid provider, \
+                 or provide a complete [llm.image] section"
+            );
+        }
+
+        let api_url = crate::config::AppConfig::build_image_api_url_from_provider(
+            resolved.provider,
+            &resolved.base_url,
+            &resolved.model,
+        );
+
+        // mime_type / aspect_ratio come from [llm.image] extras, falling back
+        // to built-in defaults when the section is absent.
+        let (mime_type, aspect_ratio) = match self.config.llm.image.as_ref() {
+            Some(image) => (image.mime_type.clone(), image.aspect_ratio.clone()),
+            None => (
+                "image/png".to_string(),
+                "3:4".to_string(),
+            ),
+        };
+
+        Ok(ResolvedImageConfig {
+            provider: resolved.provider,
+            api_key: resolved.api_key,
+            model: resolved.model,
+            api_url,
+            mime_type,
+            aspect_ratio,
+        })
     }
 
     pub async fn generate(
@@ -135,13 +218,6 @@ impl SummaryImageGenerator {
         summary: &Summary,
         extra_requirements: Option<&str>,
     ) -> Result<GeneratedSummaryImage> {
-        let image_config = self
-            .config
-            .llm
-            .image
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("未配置 llm.image，无法生成总结信息图"))?;
-
         let weak_points: Vec<String> = serde_json::from_str(&summary.weak_points).unwrap_or_default();
         let prompt = crate::llm::prompts::build_summary_infographic_prompt(
             &summary.subject,
@@ -151,9 +227,31 @@ impl SummaryImageGenerator {
             extra_requirements,
         );
 
+        let generated = self.generate_raw_image(&prompt).await?;
+        let record = SummaryImage {
+            id: Uuid::new_v4().to_string(),
+            summary_id: summary.id.clone(),
+            prompt,
+            image_path: generated.image_path.clone(),
+            mime_type: generated.mime_type,
+            created_at: chrono::Utc::now().timestamp(),
+            data_version: DATA_VERSION_CURRENT,
+            generator_version: Some("summary-image/v1".to_string()),
+        };
+        self.repository.insert_summary_image(&record).await?;
+
+        Ok(GeneratedSummaryImage {
+            full_path: generated.full_path,
+            record,
+        })
+    }
+
+    pub async fn generate_raw_image(&self, prompt: &str) -> Result<GeneratedStoredImage> {
+        let image_config = self.resolve_image_config()?;
+
         let response = match image_config.provider {
-            ImageProvider::Google => self.generate_google_image(&prompt).await?,
-            ImageProvider::Openai => self.generate_openai_image(&prompt).await?,
+            ChatProvider::Google => self.generate_google_image(&image_config, &prompt).await?,
+            ChatProvider::Openai => self.generate_openai_image(&image_config, &prompt).await?,
         };
         let mime_type = response
             .mime_type
@@ -167,35 +265,14 @@ impl SummaryImageGenerator {
 
         let extension = extension_from_mime_type(&mime_type);
         let image_path = self.storage.save_bytes(&bytes, extension).await?;
-        let record = SummaryImage {
-            id: Uuid::new_v4().to_string(),
-            summary_id: summary.id.clone(),
-            prompt,
-            image_path: image_path.clone(),
-            mime_type,
-            created_at: chrono::Utc::now().timestamp(),
-        };
-        self.repository.insert_summary_image(&record).await?;
-
-        Ok(GeneratedSummaryImage {
+        Ok(GeneratedStoredImage {
             full_path: self.storage.full_path(&image_path),
-            record,
+            image_path,
+            mime_type,
         })
     }
 
-    async fn generate_google_image(&self, prompt: &str) -> Result<GoogleImagePrediction> {
-        let image_config = self
-            .config
-            .llm
-            .image
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("未配置 llm.image"))?;
-
-        let api_url = self
-            .config
-            .image_api_url()
-            .ok_or_else(|| anyhow::anyhow!("无法构造图片 API 地址"))?;
-
+    async fn generate_google_image(&self, image_config: &ResolvedImageConfig, prompt: &str) -> Result<GoogleImagePrediction> {
         let body = if image_config.model.starts_with("gemini-") {
             serde_json::json!({
                 "contents": [{
@@ -222,13 +299,13 @@ impl SummaryImageGenerator {
             })
         };
 
-        tracing::debug!(url = %api_url, body = %serde_json::to_string(&body).unwrap_or_default(), "发送总结信息图生成请求");
+        tracing::debug!(url = %image_config.api_url, body = %serde_json::to_string(&body).unwrap_or_default(), "发送总结信息图生成请求");
 
         let retry_config = &self.config.llm.retry;
         let mut last_error = None;
 
         for attempt in 0..retry_config.max_attempts {
-            match self.send_google_image_request(&api_url, &image_config.api_key, &image_config.model, &body).await {
+            match self.send_google_image_request(&image_config.api_url, &image_config.api_key, &image_config.model, &body).await {
                 Ok(prediction) => return Ok(prediction),
                 Err(error) => {
                     let retryable = is_retryable_status_error(&error);
@@ -255,19 +332,7 @@ impl SummaryImageGenerator {
         Err(last_error.unwrap_or_else(|| anyhow::anyhow!("图片生成未知错误")))
     }
 
-    async fn generate_openai_image(&self, prompt: &str) -> Result<GoogleImagePrediction> {
-        let image_config = self
-            .config
-            .llm
-            .image
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("未配置 llm.image"))?;
-
-        let api_url = self
-            .config
-            .image_api_url()
-            .ok_or_else(|| anyhow::anyhow!("无法构造图片 API 地址"))?;
-
+    async fn generate_openai_image(&self, image_config: &ResolvedImageConfig, prompt: &str) -> Result<GoogleImagePrediction> {
         let body = serde_json::json!({
             "model": image_config.model,
             "prompt": prompt,
@@ -275,14 +340,14 @@ impl SummaryImageGenerator {
             "output_format": openai_output_format_from_mime_type(&image_config.mime_type),
         });
 
-        tracing::debug!(url = %api_url, body = %serde_json::to_string(&body).unwrap_or_default(), "发送 OpenAI 总结信息图生成请求");
+        tracing::debug!(url = %image_config.api_url, body = %serde_json::to_string(&body).unwrap_or_default(), "发送 OpenAI 总结信息图生成请求");
 
         let retry_config = &self.config.llm.retry;
         let mut last_error = None;
 
         for attempt in 0..retry_config.max_attempts {
             match self
-                .send_openai_image_request(&api_url, &image_config.api_key, &body, &image_config.mime_type)
+                .send_openai_image_request(&image_config.api_url, &image_config.api_key, &body, &image_config.mime_type)
                 .await
             {
                 Ok(prediction) => return Ok(prediction),

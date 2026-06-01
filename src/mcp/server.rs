@@ -21,6 +21,7 @@ use crate::practice::generator::PracticeGenerator;
 use crate::storage::image::ImageStorage;
 use crate::summary::generator::SummaryGenerator;
 use crate::summary::image_generator::SummaryImageGenerator;
+use crate::summary::cascade_delete::cascade_delete_summary;
 
 fn json_ok(data: serde_json::Value) -> String {
     serde_json::json!({
@@ -131,6 +132,7 @@ impl McpHandler {
                     let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
                 }
                 Err(e) => {
+                    tracing::error!(job_id = %job_id, error = %e, "Analyze error job failed");
                     let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
                 }
             }
@@ -175,6 +177,7 @@ impl McpHandler {
                     let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
                 }
                 Err(e) => {
+                    tracing::error!(job_id = %job_id, error = %e, "Summary generation job failed");
                     let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
                 }
             }
@@ -184,22 +187,24 @@ impl McpHandler {
     fn spawn_practice_job(&self, job_id: String, summary_id: String, count: u32, requirements: Option<String>, output_path: Option<String>) {
         let config = (*self.config).clone();
         let pdf_config = config.pdf.clone();
+        let generated_image_dir = config.storage.generated_image_dir.clone();
         let chat_client = (*self.chat_client).clone();
         let repository = self.repository();
         let concurrency = Arc::clone(&self.concurrency);
+        let generated_image_storage = ImageStorage::new(generated_image_dir.clone());
 
         tokio::spawn(async move {
             let now = chrono::Utc::now().timestamp();
             let _ = repository.mark_mcp_job_running(&job_id, Some("正在生成巩固练习题"), now).await;
             let _guard = concurrency.lock().await;
-            let generator = PracticeGenerator::new(config, chat_client, repository.clone());
+            let generator = PracticeGenerator::new(config, chat_client, repository.clone(), generated_image_storage);
 
             match generator.generate(&summary_id, count, requirements.as_deref(), None).await {
                 Ok(practice) => {
                     let questions: Vec<PracticeQuestion> = serde_json::from_str(&practice.questions).unwrap_or_default();
                     let mut pdf_path = practice.pdf_path.clone();
                     if let Some(path) = output_path {
-                        match crate::pdf::generate_pdf(&practice, &pdf_config, &path) {
+                        match crate::pdf::generate_pdf(&practice, &pdf_config, Some(&generated_image_dir), &path) {
                             Ok(pdf_out) => {
                                 pdf_path = Some(pdf_out.path.clone());
                                 let _ = repository.update_practice_set_pdf_path(&practice.id, &pdf_out.path).await;
@@ -225,6 +230,7 @@ impl McpHandler {
                     let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
                 }
                 Err(e) => {
+                    tracing::error!(job_id = %job_id, error = %e, "Practice generation job failed");
                     let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
                 }
             }
@@ -258,6 +264,7 @@ impl McpHandler {
                     let _ = repository.complete_mcp_job(&job_id, &result.to_string(), chrono::Utc::now().timestamp()).await;
                 }
                 Err(e) => {
+                    tracing::error!(job_id = %job_id, error = %e, "Summary image generation job failed");
                     let _ = repository.fail_mcp_job(&job_id, &e.to_string(), chrono::Utc::now().timestamp()).await;
                 }
             }
@@ -377,6 +384,12 @@ pub struct PracticePdfParams {
     pub practice_id: String,
     /// PDF 输出路径
     pub output_path: String,
+}
+
+#[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
+pub struct CascadeDeleteSummaryParams {
+    /// 总结记录 ID
+    pub summary_id: String,
 }
 
 #[derive(Debug, rmcp::serde::Deserialize, rmcp::schemars::JsonSchema)]
@@ -869,7 +882,7 @@ impl McpHandler {
         let repo = self.repository();
 
         match repo.get_practice_set(&params.practice_id).await {
-            Ok(Some(practice)) => match crate::pdf::generate_pdf(&practice, &self.config.pdf, &params.output_path) {
+            Ok(Some(practice)) => match crate::pdf::generate_pdf(&practice, &self.config.pdf, Some(&self.config.storage.generated_image_dir), &params.output_path) {
                 Ok(pdf_out) => {
                     if let Err(e) = repo
                         .update_practice_set_pdf_path(&params.practice_id, &pdf_out.path)
@@ -891,6 +904,26 @@ impl McpHandler {
             },
             Ok(None) => json_err(format!("未找到练习集: {}", params.practice_id)),
             Err(e) => json_err(format!("查询失败: {}", e)),
+        }
+    }
+
+    #[tool(description = "级联删除阶段性总结：同时删除关联的 summary_images 和 practice_sets 记录，以及生成的信息图文件。不会自动删除练习 PDF 文件。")]
+    async fn cascade_delete_summary(&self, params: Parameters<CascadeDeleteSummaryParams>) -> String {
+        let params = params.0;
+        let repo = self.repository();
+        let generated_image_dir = self.config.storage.generated_image_dir.clone();
+
+        match cascade_delete_summary(&repo, &params.summary_id, generated_image_dir).await {
+            Ok(result) => json_ok(serde_json::json!({
+                "type": "cascade_delete_summary",
+                "summary_id": result.summary_id,
+                "deleted_summary": result.deleted_summary,
+                "deleted_summary_images": result.deleted_summary_images,
+                "deleted_practice_sets": result.deleted_practice_sets,
+                "deleted_generated_image_files": result.deleted_generated_image_files,
+                "note": "practice_sets 的 PDF 文件未被自动删除，因为可能指向用户选择的输出路径",
+            })),
+            Err(e) => json_err(format!("级联删除总结失败: {}", e)),
         }
     }
 }

@@ -1,25 +1,79 @@
-[llm.chat]
-provider = "openai"
-base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
-api_key = "your-chat-api-key"
-model = "gemini-3.1-pro-preview"
+# ═══════════════════════════════════════════════════════════════════════
+# 错题本配置示例
+#
+# 推荐使用 provider+roles 为主的配置模型（见下方"推荐配置"）。
+# legacy 段 (`llm.chat` / `llm.embedding` / `llm.image`) 为 fallback-only，
+# 仅在未通过 role 绑定 provider 时才被使用。
+# ═══════════════════════════════════════════════════════════════════════
 
-[llm.embedding]
+# ── 推荐配置：provider+roles 优先 ──────────────────────────────────
+# 所有 provider/base_url/api_key/model 集中在 [llm.providers.*] 中定义，
+# 然后通过 [llm.roles] 绑定到具体业务角色。
+
+[llm.providers.gemini-pro]
+provider = "openai"              # 协议: "openai" 或 "google"，默认 "openai"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+api_key = "your-gemini-api-key"
+model = "gemini-3.1-pro-preview"
+# max_output_tokens = 12000       # 可选：按 provider 单独设置输出上限
+
+[llm.providers.gemini-embedding]
 provider = "google"
 base_url = "https://generativelanguage.googleapis.com"
-api_key = "your-embedding-api-key"
+api_key = "your-gemini-api-key"
 model = "gemini-embedding-2-preview"
+
+[llm.providers.gemini-image]
+provider = "google"
+base_url = "https://generativelanguage.googleapis.com"
+api_key = "your-gemini-api-key"
+model = "gemini-3.1-flash-image-preview"
+
+[llm.roles]
+vision_recognition = "gemini-pro"       # 图片识别
+structured_extraction = "gemini-pro"    # 结构化提取
+pedagogical_analysis = "gemini-pro"     # 教学分析
+summary_synthesis = "gemini-pro"        # 阶段总结
+infographic_planning = "gemini-pro"     # 信息图规划
+practice_planning = "gemini-pro"        # 练习题规划
+practice_generation = "gemini-pro"      # 巩固练习生成
+image_generation = "gemini-image"       # 图片生成
+embedding = "gemini-embedding"          # embedding
+
+# 说明：
+# - `analyze` 命令会使用以上分析角色
+# - `backfill --scope error-records-analysis` 也会使用
+#   `vision_recognition` / `structured_extraction` / `pedagogical_analysis`
+# - 如果不使用 role 绑定，也可以改为配置 legacy [llm.chat] 作为 fallback
+
+# ── Legacy fallback（可选）─────────────────────────────────────────
+# 以下三个段均为 fallback-only。当 [llm.roles] 中某角色未绑定或绑定的
+# provider 不存在时才会使用 legacy 配置。
+#
+# 如果所有角色都已通过 roles 绑定，则可以省略这些段。但如果要保留
+# fallback 兼容，可以配置完整的 legacy 段。
+
+# [llm.chat]  ← fallback-only，可省略
+# provider = "openai"
+# base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# api_key = "your-chat-api-key"
+# model = "gemini-3.1-pro-preview"
+
+# ── embedding 最小配置 ──────────────────────────────────────────────
+# 当 embedding role 绑定了 provider 后，[llm.embedding] 只需提供
+# 额外字段（dimensions）。provider/base_url/api_key/model 从 role 获取。
+[llm.embedding]
 dimensions = 1536
 
+# ── image 最小配置 ──────────────────────────────────────────────────
+# 当 image_generation role 绑定了 provider 后，[llm.image] 只需提供
+# 额外字段（mime_type、aspect_ratio）。provider/base_url/api_key/model 从 role 获取。
+# 如果完全省略 [llm.image]，则使用内置默认值 (image/png, 3:4)。
 [llm.image]
-provider = "openai"
-base_url = "https://api.openai.com/v1"
-api_key = "your-image-api-key"
-model = "gpt-image-1"
 mime_type = "image/png"
 aspect_ratio = "3:4"
 
-# ── 统一 HTTP 配置 ──────────────────────────────────────────────
+# ── 统一 HTTP 配置 ──────────────────────────────────────────────────
 # 所有 LLM HTTP 客户端（chat / embedding / image / image_download）
 # 共享同一套 transport 默认值，每个 service 可单独 override request_timeout_secs。
 #
@@ -52,6 +106,91 @@ aspect_ratio = "3:4"
 # download_timeout_secs = 120     # 下载已生成图片的超时（秒）
 # 优先级：llm.http.image.request_timeout_secs > llm.image.request_timeout_secs
 
+# ── Thinking / Reasoning 控制字段（DeepSeek V4 Pro 等）─────────────
+# 部分模型支持 thinking 和 reasoning_effort 参数，控制推理深度。
+# 这些字段仅在 provider = "openai" 时生效，Google 原生协议会自动忽略。
+#
+# 配置方式（三选一）：
+#
+# 1. 扁平写法（在 [llm.chat] 或 [llm.providers.*] 中直接写）：
+#
+# [llm.chat]
+# thinking_enabled = true          # true → { type: "enabled" }
+# reasoning_effort = "max"         # "high" | "max"
+#
+# [llm.providers.deepseek-think]
+# thinking_enabled = true
+# reasoning_effort = "max"
+#
+# 2. 嵌套写法（[llm.chat.thinking] 或 [llm.providers.*.thinking]）：
+#
+# [llm.chat.thinking]
+# thinking_enabled = true
+# reasoning_effort = "max"
+#
+# [llm.providers.deepseek-think.thinking]
+# thinking_enabled = true
+# reasoning_effort = "max"
+#
+# 3. 通过 role 绑定：
+#
+# [llm.roles]
+# pedagogical_analysis = "deepseek-think"
+#
+# 优先级：嵌套 thinking > 扁平字段。role 绑定的 provider > legacy [llm.chat]。
+# 未配置时不注入任何字段。
+
+# ── OpenAI 兼容性开关 ──────────────────────────────────────────────
+# 某些 OpenAI 兼容中继（relay）可能不完全支持标准 OpenAI 协议的全部特性。
+# 以下开关用于绕过已知的不兼容问题，仅在 provider = "openai" 时生效。
+#
+# openai_no_system_role = true
+#   当中继拒绝 system 角色时，启用此选项会将所有 system 消息合并到
+#   第一条 user 消息的开头。适用于某些 DeepSeek V4 Pro 中继。
+#
+# structured_json_output = true
+#   通用结构化 JSON 输出开关，同时支持 OpenAI 和 Google provider。
+#   - OpenAI：注入 response_format: { "type": "json_object" }。
+#   - Google：注入 responseMimeType: "application/json" 和 responseSchema。
+#   目前主要用于 practice_generation 角色以提高练习题生成成功率。
+#   可在 [llm.providers.*] 或 [llm.chat] 中配置。
+#
+# max_output_tokens = 12000
+#   Chat/generate 请求的最大输出 token 数。可在 [llm.providers.*] 或 [llm.chat]
+#   中配置。建议对 practice_planning 绑定的 provider 适当调大；若 Google 中转站
+#   开启 structured_json_output 会报 503，可先关闭 structured_json_output，仅保留较大的
+#   max_output_tokens。
+#
+# 示例：为 practice_generation 角色启用结构化输出
+#
+# [llm.providers.gemini-structured]
+# provider = "google"
+# base_url = "https://generativelanguage.googleapis.com"
+# api_key = "your-gemini-api-key"
+# model = "gemini-3.1-pro-preview"
+# structured_json_output = true
+#
+# [llm.roles]
+# practice_generation = "gemini-structured"
+#
+# 示例：DeepSeek 中继不支持 system 角色且需要 JSON 输出
+#
+# [llm.providers.deepseek-relay]
+# provider = "openai"
+# base_url = "https://your-relay.example.com/v1"
+# api_key = "your-relay-api-key"
+# model = "deepseek-v4-pro"
+# openai_no_system_role = true
+# structured_json_output = true
+#
+# [llm.roles]
+# structured_extraction = "deepseek-relay"
+#
+# 同样的开关也可用于 legacy [llm.chat] 段：
+# [llm.chat]
+# openai_no_system_role = true
+# structured_json_output = true
+
 [llm.retry]
 max_attempts = 5
 base_delay_ms = 500
@@ -66,6 +205,9 @@ url = "file://./data/error_book.db"
 image_dir = "./data/images"
 pdf_dir = "./data/pdfs"
 generated_image_dir = "./data/generated-images"
+
+# 说明：`backfill --scope error-records-analysis` 会从 storage.image_dir
+# 读取历史已保存图片重新分析，因此旧图片文件需要仍然存在。
 
 [defaults]
 grade_level = "二年级"

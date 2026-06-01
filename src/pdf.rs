@@ -3,6 +3,8 @@ use crate::config::PdfConfig;
 use crate::db::models::PracticeSet;
 
 use chrono::{Datelike, Timelike};
+use std::collections::HashMap;
+use std::path::Path;
 use typst::diag::FileError;
 use typst::foundations::{Bytes, Datetime};
 use typst::syntax::{FileId, Source, VirtualPath};
@@ -10,6 +12,8 @@ use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{compile, Library, LibraryExt, World};
 use typst_pdf::{pdf, PdfOptions};
+
+type ImageAssetMap = HashMap<String, Bytes>;
 
 /// PDF 文件信息
 #[derive(Debug, Clone)]
@@ -21,6 +25,7 @@ pub struct PdfOutput {
 pub fn generate_pdf(
     practice: &PracticeSet,
     pdf_config: &PdfConfig,
+    generated_image_dir: Option<&Path>,
     pdf_path: &str,
 ) -> anyhow::Result<PdfOutput> {
     let questions: Vec<PracticeQuestion> =
@@ -30,10 +35,11 @@ pub fn generate_pdf(
     let (fonts, font_family) = load_fonts(&pdf_config.font_path)?;
 
     // 构建 Typst 标记源码
-    let markup = build_typst_markup(&questions, &practice.subject, &font_family);
+    let image_assets = collect_image_assets(&questions, generated_image_dir)?;
+    let markup = build_typst_markup(&questions, &practice.subject, &font_family, &image_assets);
 
     // 创建 Typst World
-    let mut world = TypstWorld::new(markup, fonts)?;
+    let mut world = TypstWorld::new(markup, fonts, image_assets)?;
 
     // 编译
     let warned = compile(&mut world);
@@ -70,10 +76,11 @@ struct TypstWorld {
     fonts: Vec<Font>,
     source: Source,
     main_id: FileId,
+    files: HashMap<String, Bytes>,
 }
 
 impl TypstWorld {
-    fn new(markup: String, fonts: Vec<Font>) -> anyhow::Result<Self> {
+    fn new(markup: String, fonts: Vec<Font>, image_assets: ImageAssetMap) -> anyhow::Result<Self> {
         let library = Library::builder().build();
         let book = {
             let mut b = FontBook::default();
@@ -84,6 +91,7 @@ impl TypstWorld {
         };
         let main_id = FileId::new_fake(VirtualPath::new("/main.typ"));
         let source = Source::new(main_id, markup);
+        let files = image_assets;
 
         Ok(Self {
             library: LazyHash::new(library),
@@ -91,6 +99,7 @@ impl TypstWorld {
             fonts,
             source,
             main_id,
+            files,
         })
     }
 }
@@ -116,8 +125,12 @@ impl World for TypstWorld {
         }
     }
 
-    fn file(&self, _id: FileId) -> Result<Bytes, FileError> {
-        Err(FileError::NotFound(std::path::PathBuf::new()))
+    fn file(&self, id: FileId) -> Result<Bytes, FileError> {
+        let key = id.vpath().as_rooted_path().to_string_lossy().to_string();
+        self.files
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| FileError::NotFound(id.vpath().as_rooted_path().to_path_buf()))
     }
 
     fn font(&self, index: usize) -> Option<Font> {
@@ -162,7 +175,12 @@ fn load_fonts(path: &std::path::Path) -> anyhow::Result<(Vec<Font>, String)> {
 // ============================================================
 
 /// 构建 Typst 标记源码：题目在前，答案 + 知识点在新页开始
-fn build_typst_markup(questions: &[PracticeQuestion], subject: &str, font_family: &str) -> String {
+fn build_typst_markup(
+    questions: &[PracticeQuestion],
+    subject: &str,
+    font_family: &str,
+    image_assets: &ImageAssetMap,
+) -> String {
     let subject = escape_typst(&sanitize_text(subject));
     let font_family = escape_typst(font_family);
     let generated_date = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -198,9 +216,18 @@ fn build_typst_markup(questions: &[PracticeQuestion], subject: &str, font_family
         ));
         m.push_str("#v(4pt)\n\n");
 
-        let question_markup = render_question_markup(&q.question);
-        for line in question_markup.lines() {
-            m.push_str(line);
+        let (question_text, image_note) = split_image_description(&q.question);
+        let question_markup = render_question_markup(&question_text);
+        m.push_str(&question_markup);
+        m.push('\n');
+        if let Some(image_markup) = question_image_markup(q, image_assets) {
+            m.push_str("\n#v(4pt)\n");
+            m.push_str(&image_markup);
+            m.push('\n');
+        }
+        if let Some(note) = image_note {
+            m.push_str("#v(2pt)\n");
+            m.push_str(&image_note_markup(&note));
             m.push('\n');
         }
         m.push_str("\n#v(10pt)\n\n");
@@ -234,7 +261,7 @@ fn build_typst_markup(questions: &[PracticeQuestion], subject: &str, font_family
         m.push_str("#v(4pt)\n\n");
 
         let answer = escape_typst(&sanitize_text(&q.answer));
-        m.push_str(&format!("答案: {}\n", answer));
+        push_labeled_multiline_typst(&mut m, "答案", &answer);
 
         let kp = escape_typst(&sanitize_text(&q.knowledge_points.join("、")));
         m.push_str(&format!("知识点: {}\n", kp));
@@ -266,6 +293,8 @@ fn escape_typst(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '#' => out.push_str("\\#"),
             '$' => out.push_str("\\$"),
+            '<' => out.push_str("\\<"),
+            '>' => out.push_str("\\>"),
             '[' => out.push_str("\\["),
             ']' => out.push_str("\\]"),
             '*' => out.push_str("\\*"),
@@ -280,10 +309,114 @@ fn escape_typst(s: &str) -> String {
 }
 
 fn render_question_markup(s: &str) -> String {
-    let text = sanitize_text(s);
-    let chars: Vec<char> = text.chars().collect();
+    let text = normalize_markdown_tables(&sanitize_text(s)).replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = text.lines().collect();
     let mut i = 0usize;
-    let mut out = String::with_capacity(text.len() + 32);
+    let mut parts: Vec<String> = Vec::new();
+
+    while i < lines.len() {
+        if let Some((consumed, table_markup)) = parse_markdown_table(&lines[i..]) {
+            parts.push(table_markup);
+            i += consumed;
+            continue;
+        }
+
+        let line = lines[i];
+        if line.trim().is_empty() {
+            parts.push(String::from("#v(4pt)"));
+        } else {
+            parts.push(render_inline_markup(line));
+        }
+        i += 1;
+    }
+
+    parts.join("\n#linebreak()\n")
+}
+
+fn collect_image_assets(
+    questions: &[PracticeQuestion],
+    generated_image_dir: Option<&Path>,
+) -> anyhow::Result<ImageAssetMap> {
+    let Some(base_dir) = generated_image_dir else {
+        return Ok(HashMap::new());
+    };
+
+    let mut assets = HashMap::new();
+    for q in questions {
+        let Some(relative) = q.image_path.as_deref() else {
+            continue;
+        };
+        let path = base_dir.join(relative);
+        if !path.is_file() {
+            tracing::warn!(path = %path.display(), "练习题配图文件不存在，PDF 中将跳过该图片");
+            continue;
+        }
+
+        let bytes = std::fs::read(&path)
+            .map(Bytes::new)
+            .map_err(|e| anyhow::anyhow!("读取练习题配图失败 {}: {}", path.display(), e))?;
+        let virtual_path = format!("/practice-images/{}", relative.replace('\\', "/"));
+        assets.insert(virtual_path, bytes);
+    }
+    Ok(assets)
+}
+
+fn question_image_markup(q: &PracticeQuestion, image_assets: &ImageAssetMap) -> Option<String> {
+    let relative = q.image_path.as_deref()?;
+    let virtual_path = format!("/practice-images/{}", relative.replace('\\', "/"));
+    if !image_assets.contains_key(&virtual_path) {
+        return None;
+    }
+
+    Some(format!(
+        "#align(center)[#image(\"{}\", width: {})]",
+        escape_typst(&virtual_path),
+        image_width_for_question(q)
+    ))
+}
+
+fn image_width_for_question(q: &PracticeQuestion) -> &'static str {
+    use crate::practice::planner::PracticeImageType;
+    match q.image_type {
+        Some(
+            PracticeImageType::GeometryDiagram
+            | PracticeImageType::Table
+            | PracticeImageType::BarChart
+            | PracticeImageType::LineChart
+            | PracticeImageType::PieChart
+            | PracticeImageType::SequenceDiagram
+            | PracticeImageType::MapOrLayout,
+        ) => "52%",
+        _ => "60%",
+    }
+}
+
+fn image_note_markup(note: &str) -> String {
+    format!(
+        "#align(left)[#text(size: 9pt, fill: luma(90))[图片说明：{}]]",
+        escape_typst(&sanitize_text(note))
+    )
+}
+
+fn split_image_description(question_text: &str) -> (String, Option<String>) {
+    let start_marker = "[图片说明：";
+    let Some(start) = question_text.find(start_marker) else {
+        return (question_text.to_string(), None);
+    };
+    let prefix = &question_text[..start];
+    let rest = &question_text[start + start_marker.len()..];
+    let Some(end) = rest.find(']') else {
+        return (question_text.to_string(), None);
+    };
+    let note = rest[..end].trim().to_string();
+    let suffix = &rest[end + 1..];
+    (format!("{}{}", prefix, suffix), Some(note))
+}
+
+fn render_inline_markup(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(s.len() + 32);
 
     while i < chars.len() {
         if let Some((consumed, width_mm)) = match_blank_at(&chars[i..]) {
@@ -295,8 +428,206 @@ fn render_question_markup(s: &str) -> String {
         out.push_str(&escape_typst(&chars[i].to_string()));
         i += 1;
     }
-
     out
+}
+
+fn parse_markdown_table(lines: &[&str]) -> Option<(usize, String)> {
+    if lines.len() < 2 {
+        return None;
+    }
+    if !looks_like_table_row(lines[0]) || !looks_like_separator_row(lines[1]) {
+        return None;
+    }
+
+    let mut consumed = 2usize;
+    let mut rows = vec![parse_table_row(lines[0])];
+    while consumed < lines.len() && looks_like_table_row(lines[consumed]) {
+        rows.push(parse_table_row(lines[consumed]));
+        consumed += 1;
+    }
+    if rows.is_empty() || rows[0].is_empty() {
+        return None;
+    }
+
+    let columns = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut cells = Vec::new();
+    for row in rows {
+        for idx in 0..columns {
+            let cell = row.get(idx).cloned().unwrap_or_default();
+            cells.push(format!("[{}]", render_inline_markup(&cell)));
+        }
+    }
+
+    Some((
+        consumed,
+        format!(
+            "#table(columns: {}, inset: 6pt, stroke: 0.5pt + luma(180), {})",
+            columns,
+            cells.join(", ")
+        ),
+    ))
+}
+
+fn normalize_markdown_tables(s: &str) -> String {
+    let normalized = s.replace('│', "|").replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i].trim_end();
+        if !looks_like_table_row(line) {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+
+        let mut row_buf = line.to_string();
+        let mut consumed = 1usize;
+        while (row_buf.matches('|').count() < 2 || non_empty_table_cells(&row_buf) < 2) && i + consumed < lines.len() {
+            let next = lines[i + consumed].trim();
+            if next.is_empty() {
+                break;
+            }
+            row_buf.push(' ');
+            row_buf.push_str(next);
+            consumed += 1;
+        }
+
+        let mut handled_pair = false;
+        if i + consumed < lines.len() {
+            let mut next_idx = i + consumed;
+            while next_idx < lines.len() {
+                let next = lines[next_idx].trim();
+                if next.is_empty() {
+                    next_idx += 1;
+                    continue;
+                }
+                if !looks_like_separator_row(next) && looks_like_table_row(next) {
+                    let next_cols = parse_table_row(next).len();
+                    let header_cols = parse_table_row(&row_buf).len();
+                    if header_cols >= 2 && next_cols >= header_cols {
+                        out.push(clean_table_row(&row_buf));
+                        out.push(markdown_separator_row(header_cols));
+                        out.push(clean_table_row(next));
+                        i = next_idx + 1;
+                        handled_pair = true;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        if handled_pair {
+            continue;
+        }
+
+        out.push(clean_table_row(&row_buf));
+        i += consumed;
+    }
+
+    insert_missing_table_separators(&out).join("\n")
+}
+
+fn clean_table_row(line: &str) -> String {
+    let row = line.replace('│', "|").replace("(\n", "(").replace("\n)", ")");
+    let collapsed = row.split_whitespace().collect::<Vec<_>>().join(" ");
+    if looks_like_table_row(&collapsed) {
+        let mut cells = parse_table_row(&collapsed);
+        if cells.len() >= 2 && cells.first().is_some_and(|c| c.trim().is_empty()) {
+            cells.remove(0);
+        }
+        format!("| {} |", cells.join(" | "))
+    } else {
+        collapsed
+    }
+}
+
+fn non_empty_table_cells(line: &str) -> usize {
+    parse_table_row(line)
+        .into_iter()
+        .filter(|cell| !cell.trim().is_empty() && cell.trim() != "│")
+        .count()
+}
+
+fn markdown_separator_row(columns: usize) -> String {
+    format!("| {} |", vec!["---"; columns].join(" | "))
+}
+
+fn insert_missing_table_separators(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        out.push(lines[i].clone());
+        if i + 1 < lines.len()
+            && looks_like_table_row(&lines[i])
+            && !looks_like_separator_row(&lines[i + 1])
+            && looks_like_table_row(&lines[i + 1])
+        {
+            let cols = parse_table_row(&lines[i]).len();
+            if cols >= 2 {
+                out.push(markdown_separator_row(cols));
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn looks_like_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains('|') && trimmed.matches('|').count() >= 2
+}
+
+fn looks_like_separator_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !looks_like_table_row(trimmed) {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect()
+}
+
+#[cfg(test)]
+fn push_multiline_typst(out: &mut String, text: &str) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut parts = normalized.split('\n').peekable();
+
+    while let Some(line) = parts.next() {
+        out.push_str(line);
+        out.push('\n');
+        if parts.peek().is_some() {
+            out.push_str("#linebreak()\n");
+        }
+    }
+}
+
+fn push_labeled_multiline_typst(out: &mut String, label: &str, text: &str) {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut parts = normalized.split('\n');
+
+    if let Some(first) = parts.next() {
+        out.push_str(&format!("{}: {}\n", label, first));
+    } else {
+        out.push_str(&format!("{}:\n", label));
+        return;
+    }
+
+    for line in parts {
+        out.push_str("#linebreak()\n");
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 fn match_blank_at(chars: &[char]) -> Option<(usize, usize)> {
@@ -397,17 +728,35 @@ mod tests {
                     question: "😀 小明有3个苹果，给了小红1个，还剩几个？请列出算式。".to_string(),
                     answer: "✅ 3 - 1 = 2，还剩2个苹果。".to_string(),
                     knowledge_points: vec!["加减法".to_string(), "应用题".to_string()],
+                    question_form: None,
+                    material_type: None,
+                    requires_image: false,
+                    image_role: None,
+                    image_type: None,
+                    dependency_mode: None,
+                    image_spec: None,
+                    image_path: None,
                 },
                 PracticeQuestion {
                     question: "请写出下列词语的反义词：\n大 - （  ）\n多 - （  ）\n快 - （  ）"
                         .to_string(),
                     answer: "大 - 小，多 - 少，快 - 慢".to_string(),
                     knowledge_points: vec!["反义词".to_string()],
+                    question_form: None,
+                    material_type: None,
+                    requires_image: false,
+                    image_role: None,
+                    image_type: None,
+                    dependency_mode: None,
+                    image_spec: None,
+                    image_path: None,
                 },
             ])
             .unwrap(),
             pdf_path: None,
             created_at: chrono::Utc::now().timestamp(),
+            data_version: 1,
+            generator_version: None,
         };
 
         let output_path = "data/test_practice.pdf";
@@ -416,7 +765,7 @@ mod tests {
             return;
         };
 
-        let result = generate_pdf(&practice, &pdf_config, output_path);
+        let result = generate_pdf(&practice, &pdf_config, None, output_path);
         assert!(result.is_ok(), "PDF generation failed: {:?}", result.err());
 
         let pdf_bytes = std::fs::read(output_path).expect("PDF file should exist");
@@ -483,6 +832,7 @@ mod tests {
         assert_eq!(escape_typst("a\\b"), "a\\\\b");
         assert_eq!(escape_typst("$x$"), "\\$x\\$");
         assert_eq!(escape_typst("*bold*"), "\\*bold\\*");
+        assert_eq!(escape_typst("x < y > z"), "x \\< y \\> z");
     }
 
     #[test]
@@ -507,5 +857,89 @@ mod tests {
         let rendered = render_question_markup("请填写 ____ 和 ______");
         assert!(rendered.contains("\\_\\_\\_\\_"));
         assert!(rendered.contains("\\_\\_\\_\\_\\_\\_"));
+    }
+
+    #[test]
+    fn test_push_multiline_typst_inserts_linebreaks() {
+        let mut out = String::new();
+        push_multiline_typst(&mut out, "第一行\n第二行\n第三行");
+        assert!(out.contains("第一行\n#linebreak()\n第二行\n#linebreak()\n第三行"));
+    }
+
+    #[test]
+    fn test_push_labeled_multiline_typst_preserves_answer_newlines() {
+        let mut out = String::new();
+        push_labeled_multiline_typst(&mut out, "答案", "步骤1\n步骤2");
+        assert!(out.contains("答案: 步骤1\n#linebreak()\n步骤2\n"));
+    }
+
+    #[test]
+    fn test_split_image_description_extracts_note() {
+        let (question, note) = split_image_description("题干\n[图片说明：一个计数器，有2颗珠子。]\n后文");
+        assert!(question.contains("题干"));
+        assert!(question.contains("后文"));
+        assert!(!question.contains("图片说明"));
+        assert_eq!(note.as_deref(), Some("一个计数器，有2颗珠子。"));
+    }
+
+    #[test]
+    fn test_parse_markdown_table_detects_basic_table() {
+        let lines = vec!["| 姓名 | 分数 |", "| --- | --- |", "| 小明 | 95 |", "| 小红 | 88 |"]; 
+        let parsed = parse_markdown_table(&lines).unwrap();
+        assert_eq!(parsed.0, 4);
+        assert!(parsed.1.contains("#table(columns: 2"));
+        assert!(parsed.1.contains("小明"));
+    }
+
+    #[test]
+    fn test_normalize_markdown_tables_repairs_two_row_table() {
+        let raw = "| 2本 | 8本 | 32本 | 38本 |\n|│\n│( ) | 科技书 | 故事书 | ( ) |";
+        let normalized = normalize_markdown_tables(raw);
+        assert!(normalized.contains("| --- | --- | --- | --- |"), "{}", normalized);
+        assert!(normalized.contains("| ( ) | 科技书 | 故事书 | ( ) |"), "{}", normalized);
+    }
+
+    #[test]
+    fn test_image_width_for_precise_question_is_smaller() {
+        let q = PracticeQuestion {
+            question: "表格题".to_string(),
+            answer: "略".to_string(),
+            knowledge_points: vec!["表格读取".to_string()],
+            question_form: None,
+            material_type: None,
+            requires_image: true,
+            image_role: None,
+            image_type: Some(crate::practice::planner::PracticeImageType::Table),
+            dependency_mode: None,
+            image_spec: None,
+            image_path: Some("abc.png".to_string()),
+        };
+        assert_eq!(image_width_for_question(&q), "52%");
+    }
+
+    #[test]
+    fn test_question_image_markup_renders_registered_asset() {
+        let q = PracticeQuestion {
+            question: "看图回答".to_string(),
+            answer: "略".to_string(),
+            knowledge_points: vec!["看图题".to_string()],
+            question_form: None,
+            material_type: None,
+            requires_image: true,
+            image_role: None,
+            image_type: None,
+            dependency_mode: None,
+            image_spec: None,
+            image_path: Some("abc.png".to_string()),
+        };
+        let mut assets = HashMap::new();
+        assets.insert(
+            "/practice-images/abc.png".to_string(),
+            Bytes::new(Vec::new()),
+        );
+
+        let markup = question_image_markup(&q, &assets).unwrap();
+        assert!(markup.contains("#image"));
+        assert!(markup.contains("/practice-images/abc.png"));
     }
 }

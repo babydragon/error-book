@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use uuid::Uuid;
 
-use crate::config::AppConfig;
-use crate::db::models::Summary;
+use crate::config::{AppConfig, RoleKind};
+use crate::db::models::{Summary, DATA_VERSION_CURRENT};
 use crate::db::repository::Repository;
 use crate::llm::client::ChatClient;
 
@@ -44,21 +44,88 @@ impl SummaryGenerator {
             );
         }
 
-        tracing::info!(count = records.len(), "查询到错题记录，开始生成总结");
+        let total_count = records.len();
+        // 统计带有结构化字段的记录数
+        let structured_count = records.iter().filter(|r| {
+            r.error_type.is_some() || r.question_type.is_some()
+        }).count();
+        tracing::info!(
+            count = total_count,
+            structured_count = structured_count,
+            "查询到错题记录，开始生成总结（其中 {} 条含结构化字段）",
+            structured_count,
+        );
 
-        // 2. 拼接错题文本
+        // 2. 构建结构化错题文本（优先使用结构化字段，缺失时回退到旧字段）
         let records_text = records.iter().enumerate().map(|(i, r)| {
+            // 优先使用清洗后的题目 Markdown，回退到 original_question
+            let question_text = r.question_markdown_clean
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&r.original_question);
+
+            // 优先使用结构化字段，缺失时回退到旧字段
+            let student_answer = r.student_answer_text
+                .as_deref()
+                .unwrap_or("（未记录）");
+            let question_type = r.question_type
+                .as_deref()
+                .unwrap_or("未分类");
+            let difficulty = r.difficulty
+                .as_deref()
+                .unwrap_or("未知");
+            let error_type = r.error_type
+                .as_deref()
+                .unwrap_or("未分析");
+            let error_subtype = r.error_subtype
+                .as_deref()
+                .unwrap_or("");
+            let root_cause = r.root_cause_code
+                .as_deref()
+                .unwrap_or("未分析");
+
+            // 错误原因：优先旧字段（内容更丰富），结构化字段作为补充分类
+            let error_reason = if r.error_reason.is_empty() {
+                "未分析"
+            } else {
+                &r.error_reason
+            };
+
+            // 改进建议：优先旧字段
+            let suggestions = if r.suggestions.is_empty() {
+                "无"
+            } else {
+                &r.suggestions
+            };
+
+            let subtype_line = if error_subtype.is_empty() {
+                String::new()
+            } else {
+                format!("\n错误子类: {}", error_subtype)
+            };
+
             format!(
                 "=== 错题 {} ===\n\
                  知识点: {}\n\
+                 题型: {}\n\
+                 难度: {}\n\
                  原题: {}\n\
+                 学生作答: {}\n\
+                 错误类型: {}{}\n\
+                 根因编码: {}\n\
                  错误原因: {}\n\
                  改进建议: {}",
                 i + 1,
                 r.classification,
-                r.original_question,
-                r.error_reason,
-                r.suggestions,
+                question_type,
+                difficulty,
+                question_text,
+                student_answer,
+                error_type,
+                subtype_line,
+                root_cause,
+                error_reason,
+                suggestions,
             )
         }).collect::<Vec<_>>().join("\n\n");
 
@@ -68,7 +135,12 @@ impl SummaryGenerator {
         let grade_level = &self.config.defaults.grade_level;
         let messages = crate::llm::prompts::build_summary_prompt(subject, grade_level, &records_text);
         tracing::info!("调用 LLM 生成总结...");
-        let raw_response = self.chat_client.chat(messages, Some(0.3)).await?;
+        let raw_response = self.chat_client.chat_with_role(
+            &self.config.llm,
+            RoleKind::SummarySynthesis,
+            messages,
+            Some(0.3),
+        ).await?;
         tracing::debug!(response_len = raw_response.len(), "LLM 总结响应");
 
         // 4. 解析响应
@@ -89,6 +161,8 @@ impl SummaryGenerator {
             detail: summary_json.detail,
             related_error_ids: serde_json::to_string(&related_ids)?,
             created_at: now.timestamp(),
+            data_version: DATA_VERSION_CURRENT,
+            generator_version: Some("summary/v1".to_string()),
         };
 
         self.repository.insert_summary(&summary).await?;

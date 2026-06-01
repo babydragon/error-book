@@ -159,6 +159,44 @@ pub enum Command {
 
     /// 启动 MCP Server (stdio 模式)
     Mcp,
+
+    /// 级联删除阶段性总结（同时删除关联的信息图和练习集记录）
+    CascadeDeleteSummary {
+        /// 总结记录 ID
+        summary_id: String,
+    },
+
+    /// 列出 backfill 运行记录
+    ListBackfillRuns {
+        /// 按范围筛选
+        #[arg(short, long)]
+        scope: Option<String>,
+        /// 返回条数限制
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+    },
+
+    /// 查看 backfill 运行详情
+    ShowBackfillRun {
+        /// 运行记录 ID
+        id: String,
+    },
+
+    /// 数据回填（升级历史记录的 data_version / 重新分析结构化字段）
+    Backfill {
+        /// Backfill 范围（error-records | error-records-analysis | all）
+        #[arg(short, long, default_value = "error-records")]
+        scope: String,
+        /// 仅模拟运行，不实际修改数据
+        #[arg(long)]
+        dry_run: bool,
+        /// 最多处理的记录数
+        #[arg(short, long)]
+        limit: Option<u64>,
+        /// 遇到错误立即停止
+        #[arg(long)]
+        fail_fast: bool,
+    },
 }
 
 /// 将 CLI Analyze 命令转换为 AnalysisRequest
